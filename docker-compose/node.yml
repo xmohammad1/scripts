@@ -2,7 +2,7 @@ services:
   node:
     container_name: node
     privileged: true
-    image: pasarguard/node:v0.5.3
+    image: pasarguard/node:latest
     ulimits:
       nofile:
         soft: 1048576
