@@ -24,44 +24,6 @@
 
 ---
 
-### 📦 Examples
-
-- **Install pasarguard with SQLite**:
-
-  ```bash
-  sudo bash -c "$(curl -fsSL https://github.com/xmohammad1/scripts/raw/main/pasarguard.sh)" @ install
-  ```
-
-- **Install pasarguard with MySQL**:
-
-  ```bash
-  sudo bash -c "$(curl -fsSL https://github.com/xmohammad1/scripts/raw/main/pasarguard.sh)" @ install --database mysql
-  ```
-
-- **Install pasarguard with PostgreSQL**:
-
-  ```bash
-  sudo bash -c "$(curl -fsSL https://github.com/xmohammad1/scripts/raw/main/pasarguard.sh)" @ install --database postgresql
-  ```
-
-- **Install pasarguard with TimescaleDB(v1+ only) and pre-release version**:
-
-  ```bash
-  sudo bash -c "$(curl -fsSL https://github.com/xmohammad1/scripts/raw/main/pasarguard.sh)" @ install --database timescaledb --pre-release
-  ```
-
-- **Install pasarguard with MariaDB and Dev branch**:
-
-  ```bash
-  sudo bash -c "$(curl -fsSL https://github.com/xmohammad1/scripts/raw/main/pasarguard.sh)" @ install --database mariadb --dev
-  ```
-
-- **Install pasarguard with MariaDB and Manual version**:
-
-  ```bash
-  sudo bash -c "$(curl -fsSL https://github.com/xmohammad1/scripts/raw/main/pasarguard.sh)" @ install --database mariadb --version v0.5.2
-  ```
-
 ## Installing Node
 
 ### Standalone packages
@@ -73,14 +35,10 @@
 
 - **Install Node**
 
-  ```bash
-  sudo bash -c "$(curl -fsSL https://github.com/xmohammad1/scripts/raw/main/pg-node.sh)" @ install
-  ```
-
 - **Install Node Manual version:**
 
   ```bash
-  sudo bash -c "$(curl -fsSL https://github.com/xmohammad1/scripts/raw/main/pg-node.sh)" @ install --version 0.1.0
+  sudo bash -c "$(curl -fsSL https://github.com/xmohammad1/scripts/raw/main/pg-node.sh)" @ install --version v0.5.3
   ```
 
 - **Install Node pre-release version:**
