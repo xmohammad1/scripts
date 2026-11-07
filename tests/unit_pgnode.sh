@@ -763,6 +763,199 @@ else
     echo "(skipped update --dev/--version tag rewrites: mikefarah yq v4 not available)"
 fi
 
+# -----------------------------------------------------------------------
+# Xray-core versions (install --xraycore, core-update --version)
+# -----------------------------------------------------------------------
+# Run a command with its output discarded (for assert_true/assert_false).
+quiet() { "$@" >/dev/null 2>&1; }
+
+assert_eq "$(normalize_xray_version "v26.10.31")" "v26.10.31" "normalize_xray_version: release tag kept"
+assert_eq "$(normalize_xray_version "26.10.31")"  "v26.10.31" "normalize_xray_version: bare version gets a v"
+assert_eq "$(normalize_xray_version "latest")"    "latest"    "normalize_xray_version: latest kept"
+assert_false "normalize_xray_version: empty"      normalize_xray_version ""
+assert_false "normalize_xray_version: two parts"  normalize_xray_version "v26.10"
+assert_false "normalize_xray_version: double v"   normalize_xray_version "vv26.10.31"
+assert_false "normalize_xray_version: injection"  normalize_xray_version 'v26.10.31;id'
+assert_false "normalize_xray_version: path"       normalize_xray_version "../v26.10.31"
+
+# resolve_xray_core_version: only a definite 404 rejects a tag, and messages go
+# to stderr so the captured tag stays clean.
+# Mock curl to answer the release-tag lookup with HTTP 200.
+curl() { printf '200'; }
+assert_eq "$(resolve_xray_core_version "v26.10.31" 2>/dev/null)" "v26.10.31" "resolve_xray_core_version: release found (200)"
+# Mock curl to answer the release-tag lookup with HTTP 404.
+curl() { printf '404'; }
+assert_false "resolve_xray_core_version: missing release (404)" quiet resolve_xray_core_version "v9.9.9"
+# Mock curl to answer like a rate-limited GitHub API (HTTP 403).
+curl() { printf '403'; }
+assert_eq "$(resolve_xray_core_version "v26.10.31" 2>/dev/null)" "v26.10.31" "resolve_xray_core_version: rate limited -> proceed"
+# Mock curl to fail like an unreachable GitHub API.
+curl() { printf '000'; return 7; }
+assert_eq "$(resolve_xray_core_version "v26.10.31" 2>/dev/null)" "v26.10.31" "resolve_xray_core_version: offline -> proceed"
+# Mock curl to list one release, as the releases API does with per_page=1.
+curl() { printf '[\n  {\n    "tag_name": "v26.10.31",\n    "prerelease": false\n  }\n]\n'; }
+assert_eq "$(resolve_xray_core_version "latest")" "v26.10.31" "resolve_xray_core_version: latest -> newest release"
+# Mock curl to answer the release list with GitHub's rate-limit reply.
+curl() { printf '{\n  "message": "API rate limit exceeded"\n}\n'; }
+assert_false "resolve_xray_core_version: latest unknown -> fail" quiet resolve_xray_core_version "latest"
+# Restore the default curl stub.
+curl() { echo ""; return 0; }
+
+# install_xray_core needs zip and unzip (CI installs both). A failed download
+# or a bad archive must keep the installed core.
+if command -v zip >/dev/null 2>&1 && command -v unzip >/dev/null 2>&1; then
+    xray_fixture="$WORK_DIR/xray-fixture"
+    mkdir -p "$xray_fixture/src"
+    printf '#!/bin/sh\necho "Xray 26.10.31"\n' >"$xray_fixture/src/xray"
+    printf 'geoip' >"$xray_fixture/src/geoip.dat"
+    printf 'geosite' >"$xray_fixture/src/geosite.dat"
+    (cd "$xray_fixture/src" && zip -q "$xray_fixture/good.zip" xray geoip.dat geosite.dat)
+    (cd "$xray_fixture/src" && zip -q "$xray_fixture/no-binary.zip" geoip.dat geosite.dat)
+    printf 'not a zip' >"$xray_fixture/bad.zip"
+    # Mock curl to record the URL and copy the fixture named by XRAY_FIXTURE to -o.
+    curl() {
+        local out="" url=""
+        while [ $# -gt 0 ]; do
+            case "$1" in
+            -o) out="$2"; shift 2 ;;
+            http*) url="$1"; shift ;;
+            *) shift ;;
+            esac
+        done
+        printf '%s\n' "$url" >"$xray_fixture/last-url"
+        [ -n "${XRAY_FIXTURE:-}" ] || return 22
+        cp "$xray_fixture/$XRAY_FIXTURE" "$out"
+    }
+    original_identify_arch=$(declare -f identify_the_operating_system_and_architecture)
+    # Mock the architecture detection to report x86_64.
+    identify_the_operating_system_and_architecture() { ARCH="64"; }
+    core_dir="$DATA_DIR/xray-core"
+    if (XRAY_FIXTURE=good.zip install_xray_core "v26.10.31") >/dev/null 2>&1; then
+        pass "install_xray_core: installs a good archive"
+    else
+        fail "install_xray_core: installs a good archive"
+    fi
+    assert_eq "$(cat "$xray_fixture/last-url")" "https://github.com/XTLS/Xray-core/releases/download/v26.10.31/Xray-linux-64.zip" \
+        "install_xray_core: downloads the release asset for this architecture"
+    assert_eq "$(cat "$core_dir/xray" 2>/dev/null)" "$(cat "$xray_fixture/src/xray")" "install_xray_core: binary installed"
+    assert_eq "$(stat -c '%a' "$core_dir/xray" 2>/dev/null)"      "755" "install_xray_core: binary is 0755"
+    assert_eq "$(stat -c '%a' "$core_dir/geoip.dat" 2>/dev/null)" "644" "install_xray_core: geoip.dat is 0644"
+    mkdir -p "$core_dir"
+    printf 'old-core' >"$core_dir/xray"
+    for fixture_case in "|a failed download" "bad.zip|a bad archive" "no-binary.zip|an archive without xray"; do
+        if (XRAY_FIXTURE="${fixture_case%%|*}" install_xray_core "v26.10.31") >/dev/null 2>&1; then
+            fail "install_xray_core: fails on ${fixture_case#*|}"
+        else
+            pass "install_xray_core: fails on ${fixture_case#*|}"
+        fi
+        assert_eq "$(cat "$core_dir/xray")" "old-core" "install_xray_core: installed core kept after ${fixture_case#*|}"
+    done
+    assert_eq "$(find "$APP_TMP_DIR" -maxdepth 1 -name 'xray-core-*' | wc -l | tr -d ' ')" "0" \
+        "install_xray_core: no staging directory left behind"
+    eval "$original_identify_arch"
+    # Restore the default curl stub.
+    curl() { echo ""; return 0; }
+else
+    echo "(skipped install_xray_core: zip/unzip not available)"
+fi
+
+# configure_xray_core_path: XRAY_EXECUTABLE_PATH must point at the core in
+# DATA_DIR as the container sees it, whatever the line held before.
+# Mock yq to print the node volume (yq_volume) and accept edits.
+yq() { if [ "${1:-}" = "eval" ] && [ "${2:-}" = "-r" ]; then printf '%s\n' "$yq_volume"; fi; return 0; }
+yq_volume="/srv/pg-data:/var/lib/pg-node"
+printf 'SERVICE_PORT = 62050\n# XRAY_EXECUTABLE_PATH = /usr/local/bin/xray\nAPI_KEY = k\n' >"$APP_DIR/.env"
+configure_xray_core_path
+assert_eq "$(grep 'XRAY_EXECUTABLE_PATH' "$APP_DIR/.env")" "XRAY_EXECUTABLE_PATH= /var/lib/pg-node/xray-core/xray" \
+    "configure_xray_core_path: commented default replaced with the container path"
+assert_eq "$(sed -n '1p;3p' "$APP_DIR/.env" | paste -sd'|' -)" "SERVICE_PORT = 62050|API_KEY = k" \
+    "configure_xray_core_path: other lines untouched"
+printf 'XRAY_EXECUTABLE_PATH = "/usr/local/bin/xray"\n' >"$APP_DIR/.env"
+configure_xray_core_path
+assert_eq "$(cat "$APP_DIR/.env")" "XRAY_EXECUTABLE_PATH= /var/lib/pg-node/xray-core/xray" \
+    "configure_xray_core_path: a path set before is replaced, not duplicated"
+yq_volume="null"
+printf 'API_KEY = k\n' >"$APP_DIR/.env"
+configure_xray_core_path
+assert_eq "$(grep 'XRAY_EXECUTABLE_PATH' "$APP_DIR/.env")" "XRAY_EXECUTABLE_PATH= $DATA_DIR/xray-core/xray" \
+    "configure_xray_core_path: appended with the host path when there is no volume"
+unset -f yq
+rm -f "$APP_DIR/.env"
+
+# install --xraycore: the core is fetched before install_node, and the .env is
+# pointed at it once install_node has written it. Reuses run_install_command;
+# --dev keeps the node version check off the network.
+saved_xray_functions=$(declare -f resolve_xray_core_version install_xray_core configure_xray_core_path)
+XRAY_INSTALL_FAILS="false"
+# Mock the release lookup to accept the requested tag as is.
+resolve_xray_core_version() { printf '%s\n' "$1"; }
+# Mock the core download and log it; fails when XRAY_INSTALL_FAILS is true.
+install_xray_core() { echo "install_xray_core $1" >> "$INSTALL_CALLS"; [ "$XRAY_INSTALL_FAILS" != "true" ]; }
+# Mock the .env update and log it.
+configure_xray_core_path() { echo "configure_xray_core_path" >> "$INSTALL_CALLS"; }
+# Print the logged install steps (curl calls left out) on one line.
+install_steps() { grep -v '^curl ' "$INSTALL_CALLS" | paste -sd'|' -; }
+
+run_install_command --dev --xraycore 26.10.31
+assert_eq "$INSTALL_STATUS" "0" "install --dev --xraycore 26.10.31: exits 0"
+assert_eq "$(install_steps)" "install_xray_core v26.10.31|install_node dev|configure_xray_core_path" \
+    "install --xraycore: core fetched before install_node, .env pointed at it afterwards"
+if [[ "$INSTALL_OUT" == *"Xray-core: v26.10.31"* ]]; then
+    pass "install --xraycore: banner names the Xray-core version"
+else
+    fail "install --xraycore: banner names the Xray-core version"
+fi
+
+XRAY_INSTALL_FAILS="true"
+run_install_command --dev --xraycore v26.10.31
+XRAY_INSTALL_FAILS="false"
+assert_eq "$INSTALL_STATUS" "1" "install --xraycore, failed download: exits 1"
+assert_eq "$(install_steps)" "install_xray_core v26.10.31" "install --xraycore, failed download: stops before install_node"
+
+run_install_command --dev
+assert_eq "$(install_steps)" "install_node dev" "install without --xraycore: keeps the image's core"
+
+run_install_command --dev --xraycore 26.10
+assert_eq "$INSTALL_STATUS" "1" "install --xraycore 26.10: rejects an invalid version"
+assert_eq "$(install_steps)" "" "install --xraycore 26.10: installs nothing"
+
+run_install_command --dev --xraycore
+assert_eq "$INSTALL_STATUS" "1" "install --xraycore without a value: exits 1"
+if [[ "$INSTALL_OUT" == *"--xraycore requires a value"* ]]; then
+    pass "install --xraycore without a value: says a value is required"
+else
+    fail "install --xraycore without a value: says a value is required (got: $INSTALL_OUT)"
+fi
+eval "$saved_xray_functions"
+
+# core-update normalizes --version before get_xray_core sees it.
+# Run update_core_command with get_xray_core stubbed; print what it was given.
+run_core_update() {
+    (
+        check_running_as_root() { :; }
+        get_xray_core() { echo "GET_XRAY_CORE=${1:-menu}"; selected_version="${1:-}"; }
+        configure_xray_core_path() { :; }
+        restart_command() { :; }
+        update_core_command "$@"
+    ) 2>&1 | grep -o 'GET_XRAY_CORE=[^ ]*\|invalid Xray-core version' | head -n 1
+}
+assert_eq "$(run_core_update --version 26.10.31)" "GET_XRAY_CORE=v26.10.31"   "core-update: bare --version gets a v"
+assert_eq "$(run_core_update --version latest)"   "GET_XRAY_CORE=latest"      "core-update: --version latest kept"
+assert_eq "$(run_core_update --version 'v1;id')"  "invalid Xray-core version" "core-update: malformed --version is rejected"
+
+# A given version (or -y) does not need the release list that only the menu shows.
+# Run get_xray_core with the release lookups and the download stubbed; print the calls.
+run_get_xray_core() {
+    (
+        list_xray_core_versions() { echo "UNEXPECTED_RELEASE_LIST"; }
+        resolve_xray_core_version() { echo "RESOLVE=$1" >&2; printf '%s\n' "$1"; }
+        install_xray_core() { echo "INSTALL=$1"; }
+        get_xray_core "$@"
+    ) 2>&1 | grep -o 'UNEXPECTED_RELEASE_LIST\|RESOLVE=[^ ]*\|INSTALL=[^ ]*' | paste -sd' ' -
+}
+assert_eq "$(run_get_xray_core v26.10.31)" "RESOLVE=v26.10.31 INSTALL=v26.10.31" "get_xray_core: a given version skips the release list"
+assert_eq "$(AUTO_CONFIRM=true run_get_xray_core)" "RESOLVE=latest INSTALL=latest" "get_xray_core: -y installs the latest release"
+
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1

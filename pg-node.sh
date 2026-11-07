@@ -1182,10 +1182,19 @@ install_command() {
     # Default values
     node_version="latest"
     node_version_set="false"
+    local xray_version="" xray_tag=""
     # Parse options
     while [[ $# -gt 0 ]]; do
         key="$1"
         case $key in
+        --xraycore)
+            if [[ -z "${2:-}" ]]; then
+                colorized_echo red "Error: --xraycore requires a value."
+                exit 1
+            fi
+            xray_version="$2"
+            shift 2
+            ;;
         -v | --version)
             if [[ "$node_version_set" == "true" ]]; then
                 colorized_echo red "Error: Cannot use --pre-release, --dev and --version options simultaneously."
@@ -1271,6 +1280,14 @@ install_command() {
             ;;
         esac
     done
+    # Reject a bad Xray-core version before anything is changed
+    if [ -n "$xray_version" ]; then
+        if ! xray_tag=$(normalize_xray_version "$xray_version"); then
+            colorized_echo red "✗ Invalid Xray-core version '$xray_version'. Use latest or a release tag (e.g. v26.10.31)"
+            exit 1
+        fi
+        xray_version="$xray_tag"
+    fi
     # Check if  node is already installed
     if is_node_installed; then
         colorized_echo red "node is already installed at $APP_DIR"
@@ -1303,14 +1320,28 @@ install_command() {
     if ! validate_node_version; then
         exit 1
     fi
+    # Fetch the requested Xray-core before the node is set up, so a missing
+    # release or a failed download aborts before its configuration is written.
+    if [ -n "$xray_version" ]; then
+        xray_version=$(resolve_xray_core_version "$xray_version") || exit 1
+        install_xray_core "$xray_version" || exit 1
+    fi
     colorized_echo cyan "================================"
     colorized_echo cyan "Installing PasarGuard Node"
     colorized_echo cyan "Version: $node_version"
+    if [ -n "$xray_version" ]; then
+        colorized_echo cyan "Xray-core: $xray_version"
+    fi
     colorized_echo cyan "================================"
     if [ "$node_version" == "dev" ]; then
         print_dev_image_note
     fi
     install_node "$node_version"
+    # install_node writes a fresh .env, so point it at the core only now
+    if [ -n "$xray_version" ]; then
+        configure_xray_core_path
+        colorized_echo green "✓ Node configured to use Xray-core $xray_version from $DATA_DIR/xray-core"
+    fi
     colorized_echo green "✓ Node installation completed for version: $node_version"
     install_node_script
     install_completion
@@ -1879,10 +1910,167 @@ update_command() {
 
     colorized_echo blue "node updated successfully"
 }
-# Function to update the Xray core
+# Normalize a requested Xray-core version to its release tag. Xray release tags
+# always carry the "v", so a bare X.Y.Z gets one (as the panel API in
+# pg-node-service.sh does); latest is kept as is.
+# Arguments:
+#   $1 - latest, vX.Y.Z or X.Y.Z
+# Outputs:
+#   The release tag, or latest.
+# Returns:
+#   1 if the version format is invalid.
+normalize_xray_version() {
+    local version="$1"
+    if [ "$version" = "latest" ]; then
+        printf 'latest\n'
+        return 0
+    fi
+    [[ "$version" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || return 1
+    printf 'v%s\n' "${version#v}"
+}
+
+# Print the tags of the newest Xray-core releases (pre-releases included, as
+# GitHub lists them), newest first, one per line.
+# Arguments:
+#   $1 - how many releases to list
+list_xray_core_versions() {
+    curl -s --connect-timeout 10 "https://api.github.com/repos/XTLS/Xray-core/releases?per_page=$1" 2>/dev/null |
+        sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
+}
+
+# Resolve a requested Xray-core version to the release tag to install: latest
+# becomes the newest release, and a tag is looked up on GitHub. Only a definite
+# 404 rejects a tag: an unreachable or rate-limited API must not block the
+# install (the download still fails for a tag that does not exist).
+# Arguments:
+#   $1 - latest or a release tag (see normalize_xray_version)
+# Outputs:
+#   The release tag on stdout; messages on stderr.
+# Returns:
+#   1 if the release does not exist or the newest one could not be found.
+resolve_xray_core_version() {
+    local version="$1"
+    local http_code=""
+    if [ "$version" = "latest" ]; then
+        version=$(list_xray_core_versions 1 | head -n 1)
+        if [ -z "$version" ]; then
+            colorized_echo red "Could not look up the latest Xray-core release on GitHub; pass a release tag instead (e.g. v26.10.31)." >&2
+            return 1
+        fi
+        printf '%s\n' "$version"
+        return 0
+    fi
+    http_code=$(curl -s -o /dev/null --max-time 10 -w "%{http_code}" "https://api.github.com/repos/XTLS/Xray-core/releases/tags/${version}" 2>/dev/null || true)
+    case "$http_code" in
+    200) ;;
+    404)
+        colorized_echo red "Xray-core version $version does not exist (see https://github.com/XTLS/Xray-core/releases)." >&2
+        return 1
+        ;;
+    *)
+        colorized_echo yellow "  ⚠ Could not verify Xray-core $version on GitHub (HTTP ${http_code:-000}); continuing anyway." >&2
+        ;;
+    esac
+    printf '%s\n' "$version"
+}
+
+# Download an Xray-core release for this machine and install it into
+# $DATA_DIR/xray-core. The archive is downloaded and extracted in a temporary
+# directory first, so a failed download or a bad archive leaves the installed
+# core untouched; install(1) unlinks each old file before writing the new one,
+# so the core of a running node can be replaced. Callers test the status
+# (install_xray_core ... || exit 1), which turns set -e off in here, so every
+# step checks its own result.
+# Arguments:
+#   $1 - release tag (e.g. v26.10.31)
+# Returns:
+#   0 on success, 1 if the download or the installation failed.
+install_xray_core() {
+    local version="$1"
+    local core_dir="$DATA_DIR/xray-core"
+    local archive="" url="" stage_dir="" file="" mode=""
+
+    identify_the_operating_system_and_architecture
+    if ! command -v curl >/dev/null 2>&1; then
+        detect_os
+        install_package curl
+    fi
+    if ! command -v unzip >/dev/null 2>&1; then
+        detect_os
+        install_package unzip
+    fi
+    archive="Xray-linux-${ARCH}.zip"
+    url="https://github.com/XTLS/Xray-core/releases/download/${version}/${archive}"
+    stage_dir=$(create_temp_dir "xray-core") || return 1
+    colorized_echo blue "Downloading Xray-core ${version} (${archive})..."
+    if ! curl -fsSL --connect-timeout 10 "$url" -o "$stage_dir/$archive"; then
+        rm -rf "$stage_dir"
+        colorized_echo red "Failed to download Xray-core from $url"
+        return 1
+    fi
+    # Create the target directory first: unlike Info-ZIP unzip, BusyBox unzip does not
+    if ! mkdir -p "$stage_dir/files" || ! unzip -q -o "$stage_dir/$archive" -d "$stage_dir/files" >/dev/null 2>&1 ||
+        [ ! -s "$stage_dir/files/xray" ]; then
+        rm -rf "$stage_dir"
+        colorized_echo red "Failed to extract the xray binary from $archive"
+        return 1
+    fi
+    if ! mkdir -p "$core_dir"; then
+        rm -rf "$stage_dir"
+        colorized_echo red "Failed to create $core_dir"
+        return 1
+    fi
+    for file in "$stage_dir/files"/*; do
+        [ -f "$file" ] || continue
+        case "${file##*/}" in
+        xray) mode=755 ;;
+        *) mode=644 ;;
+        esac
+        if ! install -m "$mode" "$file" "$core_dir/${file##*/}"; then
+            rm -rf "$stage_dir"
+            colorized_echo red "Failed to install ${file##*/} into $core_dir"
+            return 1
+        fi
+    done
+    rm -rf "$stage_dir"
+    colorized_echo green "✓ Xray-core ${version} installed to $core_dir"
+}
+
+# Point the node at the core in $DATA_DIR/xray-core: keep the node's data
+# volume on DATA_DIR and set XRAY_EXECUTABLE_PATH in .env to the path the
+# binary has inside the container.
+configure_xray_core_path() {
+    local service_name="node"
+    local existing_volume="" container_path="" xray_path=""
+    existing_volume=$(yq eval -r ".services[\"$service_name\"].volumes[0]" "$APP_DIR/docker-compose.yml")
+    if [ -n "$existing_volume" ] && [ "$existing_volume" != "null" ]; then
+        # Extract container path (everything after the colon)
+        if [[ "$existing_volume" == *:* ]]; then
+            container_path="${existing_volume#*:}"
+        else
+            # If no colon found, use the existing volume as container path
+            container_path="$existing_volume"
+        fi
+        # Update volumes to use DATA_DIR (which is based on APP_NAME)
+        yq eval ".services[\"$service_name\"].volumes[0] = \"${DATA_DIR}:${container_path}\"" -i "$APP_DIR/docker-compose.yml"
+        xray_path="${container_path}/xray-core/xray"
+    else
+        # Fallback to APP_NAME-based path if no volume mapping is detected
+        xray_path="${DATA_DIR}/xray-core/xray"
+    fi
+    # Replace the line whether it is still commented out or was set before (by
+    # an earlier core-update or by hand), so the node really runs this core
+    sed -i -E "s|^[[:space:]]*#?[[:space:]]*XRAY_EXECUTABLE_PATH[[:space:]]*=.*|XRAY_EXECUTABLE_PATH= ${xray_path}|" "$APP_DIR/.env"
+    grep -qE '^XRAY_EXECUTABLE_PATH[[:space:]]*=' "$APP_DIR/.env" || echo "XRAY_EXECUTABLE_PATH= ${xray_path}" >>"$APP_DIR/.env"
+}
+
+# Pick the Xray-core version for core-update and install it: the requested
+# version, the newest release with -y, or one chosen from a menu of the newest
+# releases. Sets selected_version to the installed release tag.
 get_xray_core() {
     local requested_version="${1:-}"
-    identify_the_operating_system_and_architecture
+    local versions=()
+    local choice="" custom_version=""
     if ! command -v curl >/dev/null 2>&1; then
         colorized_echo yellow "curl is required. Attempting to install curl."
         detect_os
@@ -1890,31 +2078,6 @@ get_xray_core() {
     fi
     # Systemd/non-TTY environments may not have TERM set; ignore clear failures to avoid exiting under set -e
     safe_clear() { clear 2>/dev/null || true; }
-    safe_clear
-    # Validate whether a specified Xray-core version exists on GitHub.
-    validate_version() {
-        local version="$1"
-        local response
-        local curl_exit_code
-        
-        # Use curl with timeout and error handling
-        response=$(curl -s --max-time 10 --connect-timeout 5 "https://api.github.com/repos/XTLS/Xray-core/releases/tags/$version" 2>&1)
-        curl_exit_code=$?
-        
-        # Check if curl failed (network error, timeout, etc.)
-        if [ $curl_exit_code -ne 0 ] || [ -z "$response" ]; then
-            echo -e "\033[1;31mError: Failed to validate version. Network error or GitHub API unavailable.\033[0m" >&2
-            echo "network_error"
-            return
-        fi
-        
-        # Check if version exists
-        if echo "$response" | grep -q '"message": "Not Found"'; then
-            echo "invalid"
-        else
-            echo "valid"
-        fi
-    }
     # Display the interactive selection menu for available Xray-core versions.
     print_menu() {
         safe_clear
@@ -1933,31 +2096,19 @@ get_xray_core() {
         echo -e "\033[1;31mQ:\033[0m Quit"
         echo -e "\033[1;32m==============================\033[0m"
     }
-    latest_releases=$(curl -s "https://api.github.com/repos/XTLS/Xray-core/releases?per_page=$LAST_XRAY_CORES")
-    versions=($(echo "$latest_releases" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'))
-    if [ ${#versions[@]} -eq 0 ]; then
-        echo -e "\033[1;31mNo Xray-core releases found.\033[0m"
-        exit 1
+    if [[ -z "$requested_version" && "$AUTO_CONFIRM" = true ]]; then
+        requested_version="latest"
     fi
     if [[ -n "$requested_version" ]]; then
-        if [[ "$requested_version" == "latest" ]]; then
-            selected_version=${versions[0]}
-        else
-            local validation_result
-            validation_result=$(validate_version "$requested_version")
-            if [ "$validation_result" == "valid" ]; then
-                selected_version="$requested_version"
-            elif [ "$validation_result" == "network_error" ]; then
-                echo -e "\033[1;31mError: Failed to validate version due to network error. Please check your internet connection and try again.\033[0m" >&2
-                exit 1
-            else
-                echo -e "\033[1;31mInvalid version or version does not exist: $requested_version. Please try again.\033[0m" >&2
-                exit 1
-            fi
-        fi
-    elif [ "$AUTO_CONFIRM" = true ]; then
-        selected_version=${versions[0]}
+        # A given version needs no release list, so a rate-limited API listing
+        # cannot block it
+        selected_version=$(resolve_xray_core_version "$requested_version") || exit 1
     else
+        mapfile -t versions < <(list_xray_core_versions "$LAST_XRAY_CORES")
+        if [ ${#versions[@]} -eq 0 ]; then
+            echo -e "\033[1;31mNo Xray-core releases found.\033[0m"
+            exit 1
+        fi
         while true; do
             print_menu
             read -p "Choose a version to install (1-${#versions[@]}), or press M to enter manually, Q to quit: " choice
@@ -1968,11 +2119,10 @@ get_xray_core() {
             elif [ "$choice" == "M" ] || [ "$choice" == "m" ]; then
                 while true; do
                     read -p "Enter the version manually (e.g., v1.2.3): " custom_version
-                    if [ "$(validate_version "$custom_version")" == "valid" ]; then
-                        selected_version="$custom_version"
+                    if ! custom_version=$(normalize_xray_version "$custom_version"); then
+                        echo -e "\033[1;31mInvalid version format. Please try again.\033[0m"
+                    elif selected_version=$(resolve_xray_core_version "$custom_version"); then
                         break 2
-                    else
-                        echo -e "\033[1;31mInvalid version or version does not exist. Please try again.\033[0m"
                     fi
                 done
             elif [ "$choice" == "Q" ] || [ "$choice" == "q" ]; then
@@ -1985,20 +2135,7 @@ get_xray_core() {
         done
     fi
     echo -e "\033[1;32mSelected version $selected_version for installation.\033[0m"
-    if ! command -v unzip >/dev/null 2>&1; then
-        echo -e "\033[1;33mInstalling required packages...\033[0m"
-        detect_os
-        install_package unzip
-    fi
-    mkdir -p "$DATA_DIR/xray-core"
-    cd "$DATA_DIR/xray-core"
-    xray_filename="Xray-linux-$ARCH.zip"
-    xray_download_url="https://github.com/XTLS/Xray-core/releases/download/${selected_version}/${xray_filename}"
-    echo -e "\033[1;33mDownloading Xray-core version ${selected_version}...\033[0m"
-    curl -fsSL "$xray_download_url" -o "$xray_filename" || die "Failed to download Xray-core from $xray_download_url"
-    echo -e "\033[1;33mExtracting Xray-core...\033[0m"
-    unzip -o "$xray_filename" >/dev/null 2>&1 || die "Failed to extract $xray_filename"
-    rm -f "$xray_filename"
+    install_xray_core "$selected_version" || exit 1
 }
 # Retrieve the currently installed Xray-core version from binary or running container.
 get_current_xray_core_version() {
@@ -2036,7 +2173,10 @@ update_core_command() {
                 colorized_echo red "Error: --version requires a value."
                 exit 1
             fi
-            core_version_arg="$2"
+            if ! core_version_arg=$(normalize_xray_version "$2"); then
+                colorized_echo red "Error: invalid Xray-core version '$2'. Use latest or a release tag (e.g. v26.10.31)."
+                exit 1
+            fi
             shift 2
             ;;
         -h | --help)
@@ -2051,28 +2191,8 @@ update_core_command() {
         esac
     done
     get_xray_core "$core_version_arg"
-    # Ensure volumes match DATA_DIR when custom name is used
-    service_name="node"
-    existing_volume=$(yq eval -r ".services[\"$service_name\"].volumes[0]" "$APP_DIR/docker-compose.yml")
-    if [ -n "$existing_volume" ] && [ "$existing_volume" != "null" ]; then
-        # Extract container path (everything after the colon)
-        if [[ "$existing_volume" == *:* ]]; then
-            container_path="${existing_volume#*:}"
-        else
-            # If no colon found, use the existing volume as container path
-            container_path="$existing_volume"
-        fi
-        # Update volumes to use DATA_DIR (which is based on APP_NAME)
-        yq eval ".services[\"$service_name\"].volumes[0] = \"${DATA_DIR}:${container_path}\"" -i "$APP_DIR/docker-compose.yml"
-        # Set XRAY_EXECUTABLE_PATH to the container path, not host path
-        sed -i "s|^# *XRAY_EXECUTABLE_PATH *=.*|XRAY_EXECUTABLE_PATH= ${container_path}/xray-core/xray|" "$APP_DIR/.env"
-        grep -q '^XRAY_EXECUTABLE_PATH=' "$APP_DIR/.env" || echo "XRAY_EXECUTABLE_PATH= ${container_path}/xray-core/xray" >>"$APP_DIR/.env"
-    else
-        # Fallback to APP_NAME-based path if no volume mapping is detected
-        local fallback_path="${DATA_DIR}/xray-core/xray"
-        sed -i "s|^# *XRAY_EXECUTABLE_PATH *=.*|XRAY_EXECUTABLE_PATH= ${fallback_path}|" "$APP_DIR/.env"
-        grep -q '^XRAY_EXECUTABLE_PATH=' "$APP_DIR/.env" || echo "XRAY_EXECUTABLE_PATH= ${fallback_path}" >>"$APP_DIR/.env"
-    fi
+    # Ensure volumes match DATA_DIR when custom name is used, and point the node at the new core
+    configure_xray_core_path
     # Restart node
     colorized_echo red "Restarting node..."
     restart_command -n --no-restart-service
@@ -2250,6 +2370,7 @@ usage() {
     colorized_echo yellow "  -v, --version VERSION   $(tput sgr0)✓  Install specific version"
     colorized_echo yellow "  --pre-release           $(tput sgr0)✓  Install pre-release version"
     colorized_echo yellow "  --dev                   $(tput sgr0)✓  Install the dev image (unreleased, for testing)"
+    colorized_echo yellow "  --xraycore VERSION      $(tput sgr0)✓  Install a specific Xray-core version (latest or e.g. v26.10.31)"
     colorized_echo yellow "  --name NAME             $(tput sgr0)✓  Install with custom name"
     colorized_echo yellow "  --override              $(tput sgr0)✓  Override existing installation"
     colorized_echo yellow "  --api-key KEY           $(tput sgr0)✓  Set API Key"
