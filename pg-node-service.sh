@@ -27,16 +27,24 @@ load_env_file() {
 # Returns: 0 = CA-signed, 2 = self-signed, 1 = invalid/unreadable.
 check_certificate() {
   local cert_file="$1"
+  local subject="" issuer=""
 
   if ! openssl x509 -in "$cert_file" -noout >/dev/null 2>&1; then
     log "Error: Invalid certificate file: $cert_file"
     return 1
   fi
 
-  # Check if certificate is self-signed
-  if openssl x509 -in "$cert_file" -noout -subject | grep -q "subject= *CN *= *" && \
-     openssl x509 -in "$cert_file" -noout -issuer | grep -q "issuer= *CN *= *" && \
-     [[ $(openssl x509 -in "$cert_file" -noout -subject) == $(openssl x509 -in "$cert_file" -noout -issuer) ]]; then
+  # A self-signed certificate is its own issuer. openssl prints the two names
+  # with different prefixes ("subject=..." / "issuer=..."), so compare them
+  # without the prefix; the raw lines can never be equal.
+  subject=$(openssl x509 -in "$cert_file" -noout -subject -nameopt RFC2253 2>/dev/null) || subject=""
+  issuer=$(openssl x509 -in "$cert_file" -noout -issuer -nameopt RFC2253 2>/dev/null) || issuer=""
+  subject="${subject#subject=}"
+  issuer="${issuer#issuer=}"
+  subject="${subject# }"
+  issuer="${issuer# }"
+
+  if [[ -n "$subject" && "$subject" == "$issuer" ]]; then
     log "Certificate is self-signed: $cert_file"
     return 2
   else
@@ -77,17 +85,6 @@ describe_certificate() {
   return 0
 }
 
-# Decide the socat client-certificate verification level: require a client cert
-# only for CA-signed certificates.
-tls_verify_level() {
-  local cert_file="$1"
-  if check_certificate "$cert_file" >/dev/null 2>&1; then
-    echo "verify=1"
-  else
-    echo "verify=0"
-  fi
-}
-
 # Byte length of a string. ${#s} counts characters, so a multibyte UTF-8 body
 # would advertise a Content-Length smaller than the bytes actually sent and
 # truncate the response; wc -c counts bytes.
@@ -95,59 +92,10 @@ byte_length() {
   printf '%s' "$1" | wc -c | tr -d '[:space:]'
 }
 
-# When sourced for testing, stop here with the functions defined.
-if [[ "${PG_NODE_SERVICE_SOURCE_ONLY:-false}" == "true" ]]; then
-  return 0
-fi
-
-APP_NAME="pg-node"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DEFAULT_ENV_FILE="/opt/$APP_NAME/.env"
-LOCAL_ENV_FILE="$SCRIPT_DIR/.env"
-ENV_FILE="${ENV_FILE:-$DEFAULT_ENV_FILE}"
-
-if [[ ! -f "$ENV_FILE" && -f "$LOCAL_ENV_FILE" ]]; then
-  ENV_FILE="$LOCAL_ENV_FILE"
-fi
-
-if [[ -f "$ENV_FILE" ]]; then
-  load_env_file
-  log "Loaded env file: $ENV_FILE"
-else
-  log "Env file not found, using defaults: $ENV_FILE"
-fi
-
-API_PORT="${API_PORT:-3000}"
 MAX_BODY=1048576
-API_KEY="${API_KEY:-}"
-
-if [[ -z "$API_KEY" ]]; then
-  log "API_KEY must be set in the env file"
-  exit 1
-fi
-
-if [[ -z "${SSL_CERT_FILE:-}" || -z "${SSL_KEY_FILE:-}" ]]; then
-  log "TLS required: set SSL_CERT_FILE and SSL_KEY_FILE in the env file"
-  exit 1
-fi
-if [[ ! -r "$SSL_CERT_FILE" ]]; then
-  log "Cannot read SSL_CERT_FILE: $SSL_CERT_FILE"
-  exit 1
-fi
-if [[ ! -r "$SSL_KEY_FILE" ]]; then
-  log "Cannot read SSL_KEY_FILE: $SSL_KEY_FILE"
-  exit 1
-fi
-if ! command -v openssl >/dev/null 2>&1; then
-  log "openssl is required for TLS mode"
-  exit 1
-fi
-
-# Validate certificate
-describe_certificate "$SSL_CERT_FILE"
-
-log "TLS enabled on port $API_PORT with cert=$SSL_CERT_FILE key=$SSL_KEY_FILE"
-log "API key protection enabled"
+# Seconds to wait for each part of a request, so a client that stalls cannot
+# hold a handler process forever.
+READ_TIMEOUT=30
 
 json_escape() {
   local s=$1
@@ -187,11 +135,13 @@ respond() {
 }
 
 handle_node_update(){
+    local exit_code=0
     log "Executing $APP_NAME update"
-   if ! $APP_NAME update --no-update-service >/dev/null 2>&1; then 
-      log "update failed with exit code: $?" 
-      respond 500 '{"detail":"update failed on server"}' 
-      return 
+    "$APP_NAME" update --no-update-service >/dev/null 2>&1 || exit_code=$?
+    if [[ $exit_code -ne 0 ]]; then
+      log "update failed with exit code: $exit_code"
+      respond 500 '{"detail":"update failed on server"}'
+      return
     fi
     respond 200 "{\"detail\":\"node updated successfully\"}"
 }
@@ -214,23 +164,34 @@ handle_node_core_update(){
       fi
     fi
 
-    if [[ -n "$core_version" ]]; then
-      log "Executing $APP_NAME core-update with version: $core_version"
-      local error_output
-      error_output=$($APP_NAME core-update --version "$core_version" 2>&1)
-      local exit_code=$?
-      if [ $exit_code -eq 0 ]; then
-        respond 200 "{\"detail\":\"node core updated successfully\"}"
+    if [[ -z "$core_version" ]]; then
+      respond 400 '{"detail":"core_version is required"}'
+      return
+    fi
+    # Same rule as node-serviced: "latest" or vX.Y.Z. Xray release tags always
+    # carry the "v", so add it when the panel sends a bare X.Y.Z.
+    if [[ "$core_version" != "latest" ]]; then
+      if [[ ! "$core_version" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        respond 400 '{"detail":"core_version must be \"latest\" or match pattern vX.X.X"}'
+        return
+      fi
+      [[ "$core_version" == v* ]] || core_version="v$core_version"
+    fi
+
+    log "Executing $APP_NAME core-update with version: $core_version"
+    local error_output="" exit_code=0
+    error_output=$("$APP_NAME" core-update --version "$core_version" 2>&1) || exit_code=$?
+    if [ $exit_code -eq 0 ]; then
+      respond 200 "{\"detail\":\"node core updated successfully\"}"
+    else
+      log "core-update failed for version: $core_version (exit code: $exit_code)"
+      log "Error output: $error_output"
+      # Extract the actual error message, removing ANSI color codes
+      local clean_error=$(echo "$error_output" | sed 's/\x1b\[[0-9;]*m//g' | head -n 1)
+      if [[ -n "$clean_error" ]]; then
+        respond 404 "{\"detail\":\"core-update failed for version $(json_escape "$core_version"): $(json_escape "$clean_error")\"}"
       else
-        log "core-update failed for version: $core_version (exit code: $exit_code)"
-        log "Error output: $error_output"
-        # Extract the actual error message, removing ANSI color codes
-        local clean_error=$(echo "$error_output" | sed 's/\x1b\[[0-9;]*m//g' | head -n 1)
-        if [[ -n "$clean_error" ]]; then
-          respond 404 "{\"detail\":\"core-update failed for version $(json_escape "$core_version"): $(json_escape "$clean_error")\"}"
-        else
-          respond 404 "{\"detail\":\"core-update failed for version $(json_escape "$core_version"). Version may not exist or network error occurred.\"}"
-        fi
+        respond 404 "{\"detail\":\"core-update failed for version $(json_escape "$core_version"). Version may not exist or network error occurred.\"}"
       fi
     fi
 }
@@ -270,7 +231,7 @@ handle_geofiles_update(){
     esac
 
     log "Executing $APP_NAME geofiles $flag"
-    if $APP_NAME geofiles "$flag" >/dev/null 2>&1; then
+    if "$APP_NAME" geofiles "$flag" >/dev/null 2>&1; then
       respond 200 '{"detail":"geofiles updated successfully"}'
     else
       log "geofiles update failed"
@@ -280,15 +241,16 @@ handle_geofiles_update(){
 
 handle_connection() {
   local request_line method path version
-  
+  LAST_STATUS=""
+
   # Read the first line and check if it's a valid HTTP request
-  if ! IFS= read -r request_line; then
+  if ! IFS= read -r -t "$READ_TIMEOUT" request_line; then
     log "Connection closed without data"
     return 1
   fi
-  
+
   request_line=${request_line%$'\r'}
-  
+
   # Check if this looks like an HTTP request (not an error message)
   if [[ ! "$request_line" =~ ^(GET|POST|PUT|DELETE|HEAD|OPTIONS|PATCH)[[:space:]]+/ ]]; then
     log "Invalid request line (likely SSL error or non-HTTP data): $request_line"
@@ -298,34 +260,49 @@ handle_connection() {
     done
     return 1
   fi
-  
+
   read -r method path version <<<"$request_line"
   log "Valid HTTP request: $method $path"
 
   local header_line content_length=0 x_api_key="" header_name header_value
   local connection="close"
-  
-  while IFS= read -r header_line; do
+
+  while true; do
+    if ! IFS= read -r -t "$READ_TIMEOUT" header_line; then
+      log "Connection closed or timed out while reading headers for $method $path"
+      return 1
+    fi
     header_line=${header_line%$'\r'}
     [[ -z "$header_line" ]] && break
-    
+
     # Skip any lines that don't look like headers
     if [[ ! "$header_line" =~ ^[[:alnum:]-]+: ]]; then
       continue
     fi
-    
-    if [[ "$header_line" =~ ^[Cc]ontent-[Ll]ength:\ ([0-9]+) ]]; then
-      content_length=${BASH_REMATCH[1]}
-    fi
+
+    # Header names are case-insensitive and the value may have whitespace
+    # around it (e.g. "content-length:12" or "Content-Length:  12").
     header_name=${header_line%%:*}
     header_value=${header_line#*:}
     header_name=${header_name,,}
-    header_value=${header_value# }
-    if [[ "$header_name" == "x-api-key" ]]; then
-      x_api_key="$header_value"
-    elif [[ "$header_name" == "connection" ]]; then
-      connection="${header_value,,}"
-    fi
+    header_value="${header_value#"${header_value%%[![:space:]]*}"}"
+    header_value="${header_value%"${header_value##*[![:space:]]}"}"
+    case "$header_name" in
+      content-length)
+        if [[ ! "$header_value" =~ ^[0-9]{1,10}$ ]]; then
+          respond 400 '{"detail":"Invalid Content-Length"}'
+          log "Invalid Content-Length for $method $path: $header_value"
+          return 1
+        fi
+        content_length=$((10#$header_value))
+        ;;
+      x-api-key)
+        x_api_key="$header_value"
+        ;;
+      connection)
+        connection="${header_value,,}"
+        ;;
+    esac
   done
 
   if [[ -z "$x_api_key" ]]; then
@@ -349,7 +326,7 @@ handle_connection() {
     # Content-Length is a byte count, but `read -N` counts characters; force a
     # byte-wise locale so exactly content_length bytes are consumed (otherwise a
     # multibyte body over-reads and the request stalls).
-    if ! LC_ALL=C IFS= read -r -N "$content_length" body; then
+    if ! LC_ALL=C IFS= read -r -t "$READ_TIMEOUT" -N "$content_length" body; then
       log "Failed to read request body"
       respond 400 '{"detail":"Failed to read request body"}'
       return 0
@@ -375,9 +352,9 @@ handle_connection() {
       respond 404 '{"detail":"Not found"}'
       ;;
   esac
-  
+
   log "Responded $LAST_STATUS to $method $path"
-  
+
   # If connection is keep-alive, wait for next request
   if [[ "$connection" == "keep-alive" ]]; then
     log "Keep-alive connection, waiting for next request..."
@@ -388,10 +365,65 @@ handle_connection() {
   fi
 }
 
+# When sourced for testing, stop here with the functions defined.
+if [[ "${PG_NODE_SERVICE_SOURCE_ONLY:-false}" == "true" ]]; then
+  return 0
+fi
+
+# The systemd unit passes APP_NAME for instances installed with --name; the
+# handlers run "$APP_NAME update" etc., so keep it instead of assuming pg-node.
+APP_NAME="${APP_NAME:-pg-node}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DEFAULT_ENV_FILE="/opt/$APP_NAME/.env"
+LOCAL_ENV_FILE="$SCRIPT_DIR/.env"
+ENV_FILE="${ENV_FILE:-$DEFAULT_ENV_FILE}"
+
+if [[ ! -f "$ENV_FILE" && -f "$LOCAL_ENV_FILE" ]]; then
+  ENV_FILE="$LOCAL_ENV_FILE"
+fi
+
+if [[ -f "$ENV_FILE" ]]; then
+  load_env_file
+  log "Loaded env file: $ENV_FILE"
+else
+  log "Env file not found, using defaults: $ENV_FILE"
+fi
+
+API_PORT="${API_PORT:-3000}"
+API_KEY="${API_KEY:-}"
+
+if [[ -z "$API_KEY" ]]; then
+  log "API_KEY must be set in the env file"
+  exit 1
+fi
+
+if [[ -z "${SSL_CERT_FILE:-}" || -z "${SSL_KEY_FILE:-}" ]]; then
+  log "TLS required: set SSL_CERT_FILE and SSL_KEY_FILE in the env file"
+  exit 1
+fi
+if [[ ! -r "$SSL_CERT_FILE" ]]; then
+  log "Cannot read SSL_CERT_FILE: $SSL_CERT_FILE"
+  exit 1
+fi
+if [[ ! -r "$SSL_KEY_FILE" ]]; then
+  log "Cannot read SSL_KEY_FILE: $SSL_KEY_FILE"
+  exit 1
+fi
+if ! command -v openssl >/dev/null 2>&1; then
+  log "openssl is required for TLS mode"
+  exit 1
+fi
+
+# Validate certificate
+describe_certificate "$SSL_CERT_FILE"
+
+log "TLS enabled on port $API_PORT with cert=$SSL_CERT_FILE key=$SSL_KEY_FILE"
+log "API key protection enabled"
+
 # Check if we should use socat (recommended) or openssl s_server
 if command -v socat >/dev/null 2>&1; then
   log "Starting HTTPS server with socat on port $API_PORT..."
-  
+
   # For socat, we need to handle the case where we're called as a subprocess
   if [[ "${1:-}" == "--handle-connection" ]]; then
     # Keep processing requests on the same connection until client disconnects or sends "close"
@@ -400,47 +432,64 @@ if command -v socat >/dev/null 2>&1; then
     done
     exit 0
   fi
-  
-  # Determine verify level based on certificate type
-  verify_level=$(tls_verify_level "$SSL_CERT_FILE")
-  if [[ "$verify_level" == "verify=1" ]]; then
-    log "Enabling client certificate verification (CA-signed certificate detected)"
-  else
-    log "Disabling client certificate verification (self-signed or invalid certificate)"
-  fi
-  
+
+  # Clients authenticate with x-api-key and the panel never presents a TLS
+  # client certificate, so do not ask for one (node-serviced likewise uses
+  # tls.NoClientCert): with verify=1 socat rejects every such client.
   exec socat \
-    "OPENSSL-LISTEN:${API_PORT},cert=${SSL_CERT_FILE},key=${SSL_KEY_FILE},${verify_level},reuseaddr,fork" \
+    "OPENSSL-LISTEN:${API_PORT},cert=${SSL_CERT_FILE},key=${SSL_KEY_FILE},verify=0,reuseaddr,fork" \
     EXEC:"'$0' --handle-connection"
 else
   log "socat not available, using openssl s_server"
   log "Install socat with your system package manager for better performance"
-  
+
   # Main server loop with openssl s_server
   log "Bash REST API listening on https://localhost:${API_PORT}"
-  
+
+  # Serve one client per s_server run so the loop below starts a fresh one for
+  # the next client. Without -naccept, s_server keeps accepting after the client
+  # leaves, so wait blocks and the next request is written into a closed pipe.
+  # (Read the help into a variable: piping it to grep -q trips pipefail.)
+  s_server_extra_opts=()
+  s_server_help=$(openssl s_server -help 2>&1 || true)
+  if [[ "$s_server_help" == *-naccept* ]]; then
+    s_server_extra_opts=(-naccept 1)
+  fi
+
   while true; do
     # Use openssl s_server with stderr redirected
-    if coproc OPENSSL { 
+    if coproc OPENSSL {
       openssl s_server \
         -quiet \
         -accept "$API_PORT" \
         -cert "$SSL_CERT_FILE" \
         -key "$SSL_KEY_FILE" \
         -ign_eof \
+        ${s_server_extra_opts[@]+"${s_server_extra_opts[@]}"} \
         2>/dev/null
     }; then
+      # Keep our own copies: bash unsets OPENSSL once the coprocess exits,
+      # which would trip set -u when the descriptors are closed below.
+      ssl_out_fd=${OPENSSL[0]:-}
+      ssl_in_fd=${OPENSSL[1]:-}
+      ssl_pid=${OPENSSL_PID:-}
+      if [[ -z "$ssl_out_fd" || -z "$ssl_in_fd" ]]; then
+        log "OpenSSL server exited immediately, retrying in 5 seconds..."
+        sleep 5
+        continue
+      fi
       log "OpenSSL server started, waiting for connections..."
-      
+
       # Handle connections - keep processing requests on the same connection
-      while handle_connection <&"${OPENSSL[0]}" >&"${OPENSSL[1]}"; do
+      while handle_connection <&"$ssl_out_fd" >&"$ssl_in_fd"; do
         log "Processing next request on same connection..."
       done
-      
+
       # Clean up file descriptors
-      exec {OPENSSL[0]}<&-
-      exec {OPENSSL[1]}>&-
-      wait "${OPENSSL_PID}" 2>/dev/null || true
+      exec {ssl_out_fd}<&- {ssl_in_fd}>&-
+      if [[ -n "$ssl_pid" ]]; then
+        wait "$ssl_pid" 2>/dev/null || true
+      fi
       log "Client disconnected, restarting OpenSSL server..."
     else
       log "Failed to start openssl s_server, retrying in 5 seconds..."
