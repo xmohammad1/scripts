@@ -41,7 +41,7 @@
   sudo bash -c "$(curl -fsSL https://github.com/xmohammad1/scripts/raw/main/pg-node.sh)" @ install --version v0.5.3
   ```
 
-- **Install Node pre-release version:**
+- **Install Node pre-release version** (the `pasarguard/node:dev` image; `--dev` is the same):
 
   ```bash
   sudo bash -c "$(curl -fsSL https://github.com/xmohammad1/scripts/raw/main/pg-node.sh)" @ install --pre-release
@@ -50,13 +50,14 @@
 - **Install Node with custom name:**
 
   ```bash
-  sudo bash -c "$(curl -fsSL https://github.com/xmohammad1/scripts/raw/main/pg-node.sh)" @ install --name Node2
+  sudo bash -c "$(curl -fsSL https://github.com/xmohammad1/scripts/raw/main/pg-node.sh)" @ install --name node2
   ```
 
   > 📌 **Tip:**
   > The `--name` flag lets you install and manage multiple Node instances using this script.
   > For example, running with `--name pg-node2` will create and manage a separate instance named `pg-node2`.
   > You can then control each node individually using its assigned name.
+  > Names must be lowercase (letters, digits, `-`, `_`), because Docker Compose rejects uppercase project names.
 
 - **Update or Change Xray-core Version**:
 

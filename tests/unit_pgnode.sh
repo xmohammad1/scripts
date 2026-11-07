@@ -90,7 +90,10 @@ assert_false "validate_san_entry: whitespace only"  validate_san_entry "   "
 # validate_app_name  (guards --name against path/systemd/sed/yq injection)
 # -----------------------------------------------------------------------
 assert_true  "validate_app_name: simple"            validate_app_name "pg-node"
-assert_true  "validate_app_name: with digit"        validate_app_name "Node2"
+assert_true  "validate_app_name: with digit"        validate_app_name "node2"
+# Docker Compose rejects uppercase project names (-p), so --name must be lowercase
+assert_false "validate_app_name: uppercase"         validate_app_name "Node2"
+assert_false "validate_app_name: non-ASCII letter"  validate_app_name "nodé"
 assert_true  "validate_app_name: underscore"        validate_app_name "my_node"
 assert_true  "validate_app_name: single char"       validate_app_name "a"
 assert_true  "validate_app_name: digit start"       validate_app_name "2node"
@@ -106,6 +109,150 @@ assert_false "validate_app_name: command sub"       validate_app_name 'a$(id)'
 assert_false "validate_app_name: leading dash"      validate_app_name "-node"
 assert_false "validate_app_name: dot"               validate_app_name "a.b"
 assert_false "validate_app_name: too long"          validate_app_name "$(printf 'a%.0s' {1..64})"
+
+# -----------------------------------------------------------------------
+# resolve_node_image_tag  (--pre-release must install the dev image)
+# -----------------------------------------------------------------------
+assert_eq "$(resolve_node_image_tag "pre-release")" "dev"         "resolve_node_image_tag: pre-release -> dev"
+assert_eq "$(resolve_node_image_tag "dev")"         "dev"         "resolve_node_image_tag: dev -> dev"
+assert_eq "$(resolve_node_image_tag "latest")"      "latest"      "resolve_node_image_tag: latest -> latest"
+assert_eq "$(resolve_node_image_tag "v0.5.7")"      "v0.5.7"      "resolve_node_image_tag: release tag kept"
+assert_eq "$(resolve_node_image_tag "v1.0.0-rc.1")" "v1.0.0-rc.1" "resolve_node_image_tag: suffixed tag kept"
+assert_false "resolve_node_image_tag: missing v"    resolve_node_image_tag "0.5.7"
+assert_false "resolve_node_image_tag: two parts"    resolve_node_image_tag "v0.5"
+assert_false "resolve_node_image_tag: empty"        resolve_node_image_tag ""
+assert_false "resolve_node_image_tag: injection"    resolve_node_image_tag 'v0.5.7;id'
+
+# -----------------------------------------------------------------------
+# check_node_version_exists  (latest/dev never depend on the GitHub API)
+# -----------------------------------------------------------------------
+curl() { echo "unexpected curl call" >&2; return 1; }
+assert_true  "check_node_version_exists: dev needs no API call"    check_node_version_exists "dev"
+assert_true  "check_node_version_exists: latest needs no API call" check_node_version_exists "latest"
+curl() { printf '200'; }
+assert_true  "check_node_version_exists: release found (200)"      check_node_version_exists "v0.5.7"
+curl() { printf '404'; }
+assert_false "check_node_version_exists: missing release (404)"    check_node_version_exists "v9.9.9"
+curl() { printf '403'; }
+assert_true  "check_node_version_exists: rate limited -> proceed"  check_node_version_exists "v0.5.7"
+curl() { printf '000'; return 7; }
+assert_true  "check_node_version_exists: offline -> proceed"       check_node_version_exists "v0.5.7"
+curl() { echo ""; return 0; }
+
+# -----------------------------------------------------------------------
+# set_node_image_tag  (needs mikefarah yq; CI runners ship it)
+# -----------------------------------------------------------------------
+if command -v yq >/dev/null 2>&1 && is_mikefarah_yq; then
+    compose_test="$WORK_DIR/compose-test.yml"
+    cp "$ROOT_DIR/docker-compose/node.yml" "$compose_test"
+    assert_true "set_node_image_tag: latest -> dev" set_node_image_tag "dev" "$compose_test"
+    assert_eq "$(yq eval -r '.services.node.image' "$compose_test")" "pasarguard/node:dev" "set_node_image_tag: image is :dev"
+    assert_eq "$(yq eval -r '.services.node.container_name' "$compose_test")" "node" "set_node_image_tag: other keys untouched"
+    printf 'services:\n  node:\n    image: pasarguard/node\n' >"$compose_test"
+    set_node_image_tag "v0.5.7" "$compose_test"
+    assert_eq "$(yq eval -r '.services.node.image' "$compose_test")" "pasarguard/node:v0.5.7" "set_node_image_tag: untagged image gets a tag"
+    printf 'services:\n  node:\n    image: registry.local:5000/pasarguard/node:latest\n' >"$compose_test"
+    set_node_image_tag "dev" "$compose_test"
+    assert_eq "$(yq eval -r '.services.node.image' "$compose_test")" "registry.local:5000/pasarguard/node:dev" "set_node_image_tag: registry port kept"
+else
+    echo "(skipped set_node_image_tag: mikefarah yq not available)"
+fi
+# The post-write check must reject a rewrite that did not land as exactly one
+# tag, whatever yq did, so the install stops instead of running :latest.
+yq() { if [ "${1:-}" = "eval" ] && [ "${2:-}" = "-r" ]; then printf '%s\n' "$yq_result"; fi; return 0; }
+for image_case in "pasarguard/node:dev|ok" "registry.local:5000/pasarguard/node:dev|ok" \
+    "pasarguard/node:latest|fail" "pasarguard/node|fail" "pasarguard/node:dev:dev|fail"; do
+    yq_result="${image_case%%|*}"
+    if set_node_image_tag "dev" "/dev/null"; then got="ok"; else got="fail"; fi
+    assert_eq "$got" "${image_case#*|}" "set_node_image_tag: verify '$yq_result' -> ${image_case#*|}"
+done
+unset -f yq
+
+# -----------------------------------------------------------------------
+# install_command: the version the options select must reach install_node
+# (--pre-release used to resolve to the latest stable release instead of dev).
+# Everything that touches the system is mocked; runs in a subshell.
+# -----------------------------------------------------------------------
+run_install_version() {
+    (
+        check_running_as_root() { :; }
+        print_script_execution_header() { :; }
+        detect_os() { :; }
+        install_package() { :; }
+        install_docker() { :; }
+        ensure_docker_compose() { :; }
+        install_yq() { :; }
+        is_mikefarah_yq() { return 0; }
+        detect_compose() { :; }
+        is_node_installed() { return 1; }
+        install_node() { echo "INSTALL_NODE_VERSION=$1"; SERVICE_PORT=62050; API_KEY="k"; }
+        install_node_script() { :; }
+        install_completion() { :; }
+        up_node() { :; }
+        show_node_logs() { :; }
+        install_service_command() { :; }
+        # latest/dev must not need the GitHub API; release tags get a 200
+        curl() { printf '200'; }
+        SSL_CERT_FILE=/dev/null
+        install_command --no-install-service "$@"
+    ) 2>&1 | grep -o 'INSTALL_NODE_VERSION=[^ ]*\|Cannot use[^.]*\|Invalid version format' | head -n 1
+}
+assert_eq "$(run_install_version --pre-release)"             "INSTALL_NODE_VERSION=dev"    "install: --pre-release installs dev"
+assert_eq "$(run_install_version --dev)"                     "INSTALL_NODE_VERSION=dev"    "install: --dev installs dev"
+assert_eq "$(run_install_version --version pre-release)"     "INSTALL_NODE_VERSION=dev"    "install: --version pre-release installs dev"
+assert_eq "$(run_install_version)"                           "INSTALL_NODE_VERSION=latest" "install: default installs latest"
+assert_eq "$(run_install_version --version v0.5.7)"          "INSTALL_NODE_VERSION=v0.5.7" "install: --version keeps the tag"
+assert_eq "$(run_install_version --pre-release --version v0.5.7)" "Cannot use --pre-release, --dev and --version options simultaneously" "install: --pre-release with --version is rejected"
+assert_eq "$(run_install_version --version 0.5.7)"           "Invalid version format"      "install: malformed --version is rejected"
+
+# -----------------------------------------------------------------------
+# is_valid_port
+# -----------------------------------------------------------------------
+assert_true  "is_valid_port: 1"           is_valid_port "1"
+assert_true  "is_valid_port: 62050"       is_valid_port "62050"
+assert_true  "is_valid_port: 65535"       is_valid_port "65535"
+assert_false "is_valid_port: 0"           is_valid_port "0"
+assert_false "is_valid_port: 65536"       is_valid_port "65536"
+assert_false "is_valid_port: letters"     is_valid_port "abc"
+assert_false "is_valid_port: mixed"       is_valid_port "1abc"
+assert_false "is_valid_port: empty"       is_valid_port ""
+assert_false "is_valid_port: arith expr"  is_valid_port 'a[$(id)]'
+
+# -----------------------------------------------------------------------
+# download_geofiles  (a failed download must not replace working files)
+# -----------------------------------------------------------------------
+geo_dir="$WORK_DIR/assets"
+mkdir -p "$geo_dir"
+printf 'old-geoip' >"$geo_dir/geoip.dat"
+printf 'old-geosite' >"$geo_dir/geosite.dat"
+# Mock: write the URL's file name into the -o target; fail for geosite.dat
+curl() {
+    local out="" url=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+        -o) out="$2"; shift 2 ;;
+        http*) url="$1"; shift ;;
+        *) shift ;;
+        esac
+    done
+    if [ "${GEO_FAIL:-}" = "${url##*/}" ]; then
+        printf '<html>404</html>' >"$out"
+        return 22
+    fi
+    printf 'new-%s' "${url##*/}" >"$out"
+}
+if (GEO_FAIL=geosite.dat download_geofiles "https://example.invalid/dl" "$geo_dir") >/dev/null 2>&1; then
+    fail "download_geofiles: fails when a download fails"
+else
+    pass "download_geofiles: fails when a download fails"
+fi
+assert_eq "$(cat "$geo_dir/geoip.dat")"   "old-geoip"   "download_geofiles: geoip.dat kept on failure"
+assert_eq "$(cat "$geo_dir/geosite.dat")" "old-geosite" "download_geofiles: geosite.dat kept on failure"
+assert_eq "$(find "$geo_dir" -name '.*' -type f | wc -l | tr -d ' ')" "0" "download_geofiles: no temp files left on failure"
+download_geofiles "https://example.invalid/dl" "$geo_dir" >/dev/null 2>&1
+assert_eq "$(cat "$geo_dir/geoip.dat")"   "new-geoip.dat"   "download_geofiles: geoip.dat replaced on success"
+assert_eq "$(cat "$geo_dir/geosite.dat")" "new-geosite.dat" "download_geofiles: geosite.dat replaced on success"
+curl() { echo ""; return 0; }
 
 # -----------------------------------------------------------------------
 # generate_uuid_v4
@@ -278,6 +425,20 @@ APP_NAME="my-node"
 ENV_FILE="/nonexistent/dir/.env"
 sync_env_ssl_paths
 pass "sync_env_ssl_paths: no crash when ENV_FILE missing"
+
+# Case 5: ENV_FILE not readable (a non-root user running e.g. status) — must
+# return instead of failing on sed -i and aborting the command under set -e
+ENV_FILE="$APP_DIR/.env"
+printf 'SSL_CERT_FILE= /var/lib/pg-node/certs/ssl_cert.pem\n' >"$ENV_FILE"
+chmod 000 "$ENV_FILE"
+if [ -r "$ENV_FILE" ]; then
+    echo "(skipped sync_env_ssl_paths unreadable case: file still readable, e.g. running as root)"
+elif (set -e; sync_env_ssl_paths) >/dev/null 2>&1; then
+    pass "sync_env_ssl_paths: returns quietly when ENV_FILE is unreadable"
+else
+    fail "sync_env_ssl_paths: returns quietly when ENV_FILE is unreadable"
+fi
+chmod 600 "$ENV_FILE"
 
 # -----------------------------------------------------------------------
 # version-script CLI command & completions

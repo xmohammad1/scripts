@@ -77,9 +77,29 @@ source "$SHARED_LIB_DIR/github.sh"
 # filesystem paths, the systemd unit (body + filename), sed/yq programs and
 # the network service's command word, so it must be restricted to a safe
 # character set to prevent path traversal and command/directive injection.
+# It is also the Docker Compose project name (-p), which Compose rejects unless
+# it is lowercase, so uppercase letters are not allowed. LC_ALL=C keeps the
+# ranges ASCII-only whatever the caller's locale is.
 validate_app_name() {
     local name="$1"
-    [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$ ]]
+    local LC_ALL=C
+    [[ "$name" =~ ^[a-z0-9][a-z0-9_-]{0,62}$ ]]
+}
+
+# Print why a --name value was rejected, suggesting the lowercase form when
+# that is the only problem.
+print_invalid_app_name_error() {
+    local name="$1"
+    echo "Error: invalid --name '$name'. Use 1-63 chars: lowercase letters, digits, '_' or '-', starting with a letter or digit." >&2
+    if [ "$name" != "${name,,}" ] && validate_app_name "${name,,}"; then
+        echo "Docker Compose only accepts lowercase project names; use --name ${name,,}" >&2
+    fi
+}
+
+# Whether a path is this instance's own CLI, installed by an earlier install.
+is_own_node_cli() {
+    local path="$1"
+    [ "$path" = "/usr/local/bin/$APP_NAME" ] && [ -f "$path" ] && grep -qi 'pasarguard' "$path" 2>/dev/null
 }
 
 # Handle global options
@@ -99,7 +119,7 @@ while [[ $# -gt 0 ]]; do
             exit 1
         fi
         if ! validate_app_name "$2"; then
-            echo "Error: invalid --name '$2'. Use 1-63 chars: letters, digits, '_' or '-', starting with a letter or digit." >&2
+            print_invalid_app_name_error "$2"
             exit 1
         fi
         APP_NAME="$2"
@@ -113,7 +133,7 @@ while [[ $# -gt 0 ]]; do
             exit 1
         fi
         if ! validate_app_name "$APP_NAME"; then
-            echo "Error: invalid --name '$APP_NAME'. Use 1-63 chars: letters, digits, '_' or '-', starting with a letter or digit." >&2
+            print_invalid_app_name_error "$APP_NAME"
             exit 1
         fi
         CUSTOM_NAME_SET=true
@@ -146,7 +166,10 @@ if [ -z "${APP_NAME:-}" ]; then
     APP_NAME="${SCRIPT_NAME%.*}"
 fi
 if [[ "$CUSTOM_NAME_SET" == true && "$COMMAND" =~ ^(install|install-script)$ ]]; then
-    if command -v "$APP_NAME" >/dev/null 2>&1; then
+    # Reinstalling an instance finds its own CLI at /usr/local/bin/$APP_NAME;
+    # only names that belong to something else are refused.
+    existing_command=$(command -v "$APP_NAME" 2>/dev/null || true)
+    if [ -n "$existing_command" ] && ! is_own_node_cli "$existing_command"; then
         echo "Error: '$APP_NAME' is an existing Linux command. Please choose a different --name." >&2
         exit 1
     fi
@@ -174,6 +197,9 @@ set_service_paths() {
     SERVICE_BINARY_PATH="/usr/local/bin/${SERVICE_NAME}"
     SERVICE_UNIT="/etc/systemd/system/${SERVICE_NAME}.service"
 }
+# Set them up front: messages such as "Skipped restarting $SERVICE_NAME" are
+# printed on paths that never call set_service_paths themselves.
+set_service_paths
 require_systemd() {
     if ! command -v systemctl >/dev/null 2>&1; then
         colorized_echo red "systemd is required to manage the service (systemctl not found)."
@@ -249,7 +275,6 @@ configure_firewall_for_port() {
     colorized_echo yellow "$hint"
 }
 install_node_script() {
-    print_script_execution_header "pg-node" "$SCRIPT_COMMIT_SHA" "install"
     colorized_echo blue "Installing node script"
     TARGET_PATH="/usr/local/bin/$APP_NAME"
     TEMP_FILE=$(create_temp_file "pg-node-script" ".sh")
@@ -316,7 +341,7 @@ install_node_service_script() {
     tmp_dir=$(create_temp_dir "node-serviced")
     archive_path="${tmp_dir}/${asset_name}"
     colorized_echo cyan "  Downloading ${asset_name}..."
-    if ! curl -sSL "$asset_url" -o "$archive_path"; then
+    if ! curl -fsSL "$asset_url" -o "$archive_path"; then
         colorized_echo red "Failed to download node-serviced from $asset_url"
         rm -rf "$tmp_dir"
         exit 1
@@ -686,6 +711,118 @@ read_and_save_file() {
         echo "$line" >>"$output_file"
     done
 }
+
+# Map a requested node version to the pasarguard/node image tag to install.
+# PasarGuard/node publishes no GitHub pre-releases (its releases are all
+# stable), so a GitHub lookup only ever finds the latest stable tag. The node's
+# pre-release channel is the "dev" image built from the dev branch, so
+# pre-release (and dev) select that image.
+# Arguments:
+#   $1 - latest, dev, pre-release or a release tag such as v0.5.7
+# Outputs:
+#   The image tag.
+# Returns:
+#   1 if the version format is invalid.
+resolve_node_image_tag() {
+    local version="$1"
+    case "$version" in
+    latest | dev)
+        printf '%s\n' "$version"
+        ;;
+    pre-release)
+        printf 'dev\n'
+        ;;
+    *)
+        [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || return 1
+        printf '%s\n' "$version"
+        ;;
+    esac
+}
+
+# Check that a node image tag can be installed. latest and dev are moving image
+# tags, not GitHub releases, so they are always accepted. A release tag is looked
+# up on GitHub and only a definite 404 rejects it: an unreachable or rate-limited
+# API must not block the install (docker pull still reports a bad tag).
+# Arguments:
+#   $1 - image tag (latest, dev or a release tag)
+# Returns:
+#   0 if the tag can be installed, 1 if that release does not exist.
+check_node_version_exists() {
+    local version="$1"
+    local http_code=""
+    if [[ "$version" == "latest" || "$version" == "dev" ]]; then
+        return 0
+    fi
+    http_code=$(curl -s -o /dev/null --max-time 10 -w "%{http_code}" "https://api.github.com/repos/PasarGuard/node/releases/tags/${version}" 2>/dev/null || true)
+    case "$http_code" in
+    200)
+        return 0
+        ;;
+    404)
+        return 1
+        ;;
+    *)
+        colorized_echo yellow "  ⚠ Could not verify $version on GitHub (HTTP ${http_code:-000}); continuing anyway."
+        return 0
+        ;;
+    esac
+}
+
+# Whether the yq on PATH is mikefarah yq v4; the Python yq has another CLI.
+is_mikefarah_yq() {
+    yq --version 2>&1 | grep -Eqi 'mikefarah|version v?4\.'
+}
+
+# Point the node service of a compose file at an image tag and confirm it took.
+# Only the tag after the last path segment is replaced (an untagged image gets
+# one), so a registry host:port prefix is kept. Needs mikefarah yq v4.
+# Arguments:
+#   $1 - image tag
+#   $2 - compose file to edit in place
+# Returns:
+#   0 if the image now carries the tag, non-zero otherwise.
+set_node_image_tag() {
+    local tag="$1"
+    local compose_file="$2"
+    local image="" last_segment=""
+    yq eval ".services[\"node\"].image = (.services[\"node\"].image | sub(\"(:[^/:]*)?\$\"; \":${tag}\"))" -i "$compose_file" || return 1
+    image=$(yq eval -r '.services["node"].image' "$compose_file") || return 1
+    # The last path segment must now be exactly "<name>:<tag>"
+    last_segment="${image##*/}"
+    [[ "$last_segment" == *":${tag}" && "${last_segment%":${tag}"}" != *:* ]]
+}
+
+# Whether a port number is an integer from 1 to 65535.
+is_valid_port() {
+    [[ "$1" =~ ^[0-9]{1,5}$ ]] && [ "$((10#$1))" -ge 1 ] && [ "$((10#$1))" -le 65535 ]
+}
+
+# Download a region's geoip.dat and geosite.dat. Both are fetched to temporary
+# files first and moved into place only when both succeeded, so a failed or
+# HTTP-error download never replaces working geofiles with an error page.
+# Arguments:
+#   $1 - release download URL that serves geoip.dat and geosite.dat
+#   $2 - assets directory
+download_geofiles() {
+    local base_url="$1"
+    local assets_dir="$2"
+    local name=""
+    local tmp_file=""
+    local tmp_files=()
+    for name in geoip.dat geosite.dat; do
+        tmp_file=$(mktemp "${assets_dir}/.${name}.XXXXXX") || die "Failed to create a temporary file in $assets_dir"
+        tmp_files+=("$tmp_file")
+        if ! curl -fsSL --connect-timeout 10 "${base_url}/${name}" -o "$tmp_file" || [ ! -s "$tmp_file" ]; then
+            rm -f "${tmp_files[@]}"
+            die "Failed to download ${base_url}/${name}; the existing geofiles were left unchanged."
+        fi
+        # mktemp creates 0600 files; keep the 0644 mode curl used to give them
+        chmod 644 "$tmp_file"
+    done
+    mv -f "${tmp_files[0]}" "${assets_dir}/geoip.dat"
+    mv -f "${tmp_files[1]}" "${assets_dir}/geosite.dat"
+}
+
 install_node() {
     local node_version=$1
     FILES_URL_PREFIX="https://raw.githubusercontent.com/PasarGuard/node/main"
@@ -763,12 +900,13 @@ install_node() {
     get_occupied_ports
     if [ -n "${INSTALL_SERVICE_PORT:-}" ]; then
         SERVICE_PORT="$INSTALL_SERVICE_PORT"
-        if is_port_occupied "$SERVICE_PORT"; then
-            colorized_echo red "Port $SERVICE_PORT is already in use."
+        if ! is_valid_port "$SERVICE_PORT"; then
+            colorized_echo red "Invalid port. Please enter a port between 1 and 65535."
             exit 1
         fi
-        if ! [[ "$SERVICE_PORT" -ge 1 && "$SERVICE_PORT" -le 65535 ]]; then
-            colorized_echo red "Invalid port. Please enter a port between 1 and 65535."
+        SERVICE_PORT=$((10#$SERVICE_PORT))
+        if is_port_occupied "$SERVICE_PORT"; then
+            colorized_echo red "Port $SERVICE_PORT is already in use."
             exit 1
         fi
     elif [ "$AUTO_CONFIRM" = true ]; then
@@ -784,7 +922,8 @@ install_node() {
             if [[ -z "$SERVICE_PORT" ]]; then
                 SERVICE_PORT=62050
             fi
-            if [[ "$SERVICE_PORT" -ge 1 && "$SERVICE_PORT" -le 65535 ]]; then
+            if is_valid_port "$SERVICE_PORT"; then
+                SERVICE_PORT=$((10#$SERVICE_PORT))
                 if is_port_occupied "$SERVICE_PORT"; then
                     colorized_echo red "Port $SERVICE_PORT is already in use. Please enter another port."
                 else
@@ -861,10 +1000,12 @@ install_node() {
     sed -i "s|^SSL_KEY_FILE *=.*|SSL_KEY_FILE= ${ssl_key_env}|" "$APP_DIR/.env"
     if [ "$node_version" != "latest" ]; then
         colorized_echo cyan "  Command: yq eval ...image = ...:${node_version}..."
-        if yq eval ".services[\"$service_name\"].image = (.services[\"$service_name\"].image | sub(\":.*$\"; \":${node_version}\"))" -i "$APP_DIR/docker-compose.yml" 2>/dev/null; then
+        if set_node_image_tag "$node_version" "$APP_DIR/docker-compose.yml"; then
             colorized_echo green "  ✓ Docker image version set to: ${node_version}"
         else
-            colorized_echo yellow "  ⚠ Failed to set image version (may not be critical)"
+            # Going on would silently install the latest image instead
+            colorized_echo red "  ✗ Failed to set the node image to :${node_version} in $APP_DIR/docker-compose.yml (mikefarah yq v4 is required)"
+            exit 1
         fi
     fi
     # Final sync to ensure env has the correct SSL paths for custom names
@@ -961,7 +1102,7 @@ update_node() {
     $COMPOSE -f $COMPOSE_FILE -p "$APP_NAME" pull
 }
 is_node_installed() {
-    if [ -d $APP_DIR ]; then
+    if [ -d "$APP_DIR" ]; then
         return 0
     else
         return 1
@@ -978,7 +1119,10 @@ sync_env_ssl_paths() {
     if [ "$APP_NAME" = "pg-node" ]; then
         return
     fi
-    if [ ! -f "$ENV_FILE" ]; then
+    # A non-root user (e.g. running status/logs) cannot read the 0600 .env;
+    # reading nothing would look like a missing path and the sed -i below
+    # would then fail and abort the command under set -e.
+    if [ ! -f "$ENV_FILE" ] || [ ! -r "$ENV_FILE" ] || [ ! -w "$ENV_FILE" ]; then
         return
     fi
     local desired_cert="${DATA_DIR}/certs/ssl_cert.pem"
@@ -1001,7 +1145,7 @@ sync_env_ssl_paths() {
     fi
 }
 is_node_up() {
-    if [ -z "$($COMPOSE -f $COMPOSE_FILE ps -q -a)" ]; then
+    if [ -z "$($COMPOSE -f "$COMPOSE_FILE" -p "$APP_NAME" ps -q -a)" ]; then
         return 1
     else
         return 0
@@ -1013,25 +1157,32 @@ install_command() {
     # Default values
     node_version="latest"
     node_version_set="false"
+    local reinstall=false
+    local image_tag=""
     # Parse options
     while [[ $# -gt 0 ]]; do
         key="$1"
         case $key in
         -v | --version)
             if [[ "$node_version_set" == "true" ]]; then
-                colorized_echo red "Error: Cannot use --pre-release and --version options simultaneously."
+                colorized_echo red "Error: Cannot use --pre-release, --dev and --version options simultaneously."
+                exit 1
+            fi
+            if [[ -z "${2:-}" ]]; then
+                colorized_echo red "Error: --version requires a value."
                 exit 1
             fi
             node_version="$2"
             node_version_set="true"
             shift 2
             ;;
-        --pre-release)
+        --pre-release | --dev)
             if [[ "$node_version_set" == "true" ]]; then
-                colorized_echo red "Error: Cannot use --pre-release and --version options simultaneously."
+                colorized_echo red "Error: Cannot use --pre-release, --dev and --version options simultaneously."
                 exit 1
             fi
-            node_version="pre-release"
+            # Both install the pasarguard/node:dev image (see resolve_node_image_tag)
+            node_version="dev"
             node_version_set="true"
             shift
             ;;
@@ -1093,6 +1244,26 @@ install_command() {
             ;;
         esac
     done
+    # Reject a bad version or certificate option before anything is changed
+    if ! image_tag=$(resolve_node_image_tag "$node_version"); then
+        colorized_echo red "✗ Invalid version format '$node_version'. Use latest, dev or a release tag (e.g. v0.5.7)"
+        exit 1
+    fi
+    node_version="$image_tag"
+    if [ -n "${INSTALL_CERT_PATH:-}" ] || [ -n "${INSTALL_KEY_PATH:-}" ]; then
+        if [ -z "${INSTALL_CERT_PATH:-}" ] || [ -z "${INSTALL_KEY_PATH:-}" ]; then
+            colorized_echo red "Error: --cert-path and --key-path must be used together."
+            exit 1
+        fi
+        if [ ! -f "$INSTALL_CERT_PATH" ]; then
+            colorized_echo red "Error: certificate file not found: $INSTALL_CERT_PATH"
+            exit 1
+        fi
+        if [ ! -f "$INSTALL_KEY_PATH" ]; then
+            colorized_echo red "Error: private key file not found: $INSTALL_KEY_PATH"
+            exit 1
+        fi
+    fi
     # Check if  node is already installed
     if is_node_installed; then
         colorized_echo red "node is already installed at $APP_DIR"
@@ -1105,6 +1276,7 @@ install_command() {
             colorized_echo red "Aborted installation"
             exit 1
         fi
+        reinstall=true
     fi
     detect_os
     if ! command -v jq >/dev/null 2>&1; then
@@ -1120,59 +1292,34 @@ install_command() {
     if ! command -v yq >/dev/null 2>&1; then
         install_yq
     fi
-    detect_compose
-    # Function to check if a version exists in the GitHub releases
-    check_version_exists() {
-        local version=$1
-        repo_url="https://api.github.com/repos/PasarGuard/node/releases"
-        if [ "$version" == "latest" ]; then
-            latest_tag=$(curl -s ${repo_url}/latest | jq -r '.tag_name')
-            # Check if there is any stable release of  node v1
-            if [ "$latest_tag" == "null" ]; then
-                return 1
-            fi
-            return 0
-        fi
-        if [ "$version" == "pre-release" ]; then
-            local latest_stable_tag=$(curl -s "$repo_url/latest" | jq -r '.tag_name')
-            local latest_pre_release_tag=$(curl -s "$repo_url" | jq -r '[.[] | select(.prerelease == true)][0].tag_name')
-            if [ "$latest_stable_tag" == "null" ] && [ "$latest_pre_release_tag" == "null" ]; then
-                return 1 # No releases found at all
-            elif [ "$latest_stable_tag" == "null" ]; then
-                node_version=$latest_pre_release_tag
-            elif [ "$latest_pre_release_tag" == "null" ]; then
-                node_version=$latest_stable_tag
-            else
-                # Compare versions using sort -V
-                local chosen_version=$(printf "%s\n" "$latest_stable_tag" "$latest_pre_release_tag" | sort -V | tail -n 1)
-                node_version=$chosen_version
-            fi
-            return 0
-        fi
-        # Check if the repos contains the version tag
-        if curl -s -o /dev/null -w "%{http_code}" "${repo_url}/tags/${version}" | grep -q "^200$"; then
-            return 0
-        else
-            return 1
-        fi
-    }
-    # Check if the version is valid and exists
-    if [[ "$node_version" == "latest" || "$node_version" == "pre-release" || "$node_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        if check_version_exists "$node_version"; then
-            colorized_echo cyan "================================"
-            colorized_echo cyan "Installing PasarGuard Node"
-            colorized_echo cyan "Version: $node_version"
-            colorized_echo cyan "================================"
-            install_node "$node_version"
-            colorized_echo green "✓ Node installation completed for version: $node_version"
-        else
-            colorized_echo red "✗ Version $node_version does not exist. Please enter a valid version (e.g. v0.1.2)"
-            exit 1
-        fi
-    else
-        colorized_echo red "✗ Invalid version format. Please enter a valid version (e.g. v1.0.0)"
+    # The compose edits below (image tag, volumes) need mikefarah yq; with the
+    # Python yq they would fail and the node would end up on the wrong image.
+    if ! is_mikefarah_yq; then
+        colorized_echo red "mikefarah yq v4 is required, but $(command -v yq) is: $(yq --version 2>&1 | head -n 1)"
+        colorized_echo yellow "Install mikefarah yq (https://github.com/mikefarah/yq) ahead of it in PATH, then re-run."
         exit 1
     fi
+    detect_compose
+    if ! check_node_version_exists "$node_version"; then
+        colorized_echo red "✗ Version $node_version does not exist. Please enter a valid version (e.g. v0.5.7)"
+        exit 1
+    fi
+    # The node being replaced still holds its ports, which would fail the port
+    # checks below (and abort a -y reinstall), so stop it first.
+    if [ "$reinstall" = true ] && [ -f "$COMPOSE_FILE" ] && is_node_up; then
+        colorized_echo yellow "Stopping the existing node before reinstalling it..."
+        down_node
+    fi
+    colorized_echo cyan "================================"
+    colorized_echo cyan "Installing PasarGuard Node"
+    colorized_echo cyan "Version: $node_version"
+    colorized_echo cyan "================================"
+    if [ "$node_version" = "dev" ]; then
+        colorized_echo yellow "Note: pasarguard/node:dev is the pre-release build of the node dev branch, not a stable release."
+        colorized_echo yellow "      '$APP_NAME update' keeps pulling the newest dev build."
+    fi
+    install_node "$node_version"
+    colorized_echo green "✓ Node installation completed for version: $node_version"
     install_node_script
     install_completion
     up_node
@@ -1258,7 +1405,7 @@ up_command() {
         *)
             echo "Error: Invalid option: $1" >&2
             help
-            exit 0
+            exit 1
             ;;
         esac
         shift
@@ -1368,6 +1515,14 @@ install_service_command() {
     fi
     ensure_env_exists
     sync_env_ssl_paths
+    # When the service is already running (re-running service-install, or
+    # reinstalling the node), it holds its own API port, so the check below
+    # would reject that port, and enable --now would not restart it to apply
+    # the new settings. Stop it first; enable --now starts it again.
+    if service_installed && systemctl is-active --quiet "$SERVICE_NAME"; then
+        colorized_echo yellow "Stopping $SERVICE_NAME to reconfigure it..."
+        systemctl stop "$SERVICE_NAME"
+    fi
     get_occupied_ports
     local api_port existing_api_port=""
     local default_api_port=62051
@@ -1567,7 +1722,7 @@ status_command() {
     fi
     echo -n "Status: "
     colorized_echo green "Up"
-    json=$($COMPOSE -f $COMPOSE_FILE ps -a --format=json)
+    json=$($COMPOSE -f "$COMPOSE_FILE" -p "$APP_NAME" ps -a --format=json)
     services=$(echo "$json" | jq -r 'if type == "array" then .[] else . end | .Service')
     states=$(echo "$json" | jq -r 'if type == "array" then .[] else . end | .State')
     # Print out the service names and statuses
@@ -1603,7 +1758,7 @@ logs_command() {
         *)
             echo "Error: Invalid option: $1" >&2
             help
-            exit 0
+            exit 1
             ;;
         esac
         shift
@@ -1792,9 +1947,12 @@ get_current_xray_core_version() {
             return
         fi
     fi
-    # If local binary is not found or failed, check in the Docker container
-    CONTAINER_NAME="$APP_NAME"
-    if docker ps --format '{{.Names}}' | grep -q "^$CONTAINER_NAME$"; then
+    # If local binary is not found or failed, check in the Docker container.
+    # Find it by its Compose labels: the default install names the container
+    # "node" (container_name in the compose file), not "$APP_NAME".
+    CONTAINER_NAME=$(docker ps --filter "label=com.docker.compose.project=${APP_NAME}" \
+        --filter "label=com.docker.compose.service=node" --format '{{.Names}}' 2>/dev/null | head -n 1)
+    if [ -n "$CONTAINER_NAME" ]; then
         version_output=$(docker exec "$CONTAINER_NAME" xray -version 2>/dev/null)
         if [ $? -eq 0 ]; then
             # Extract the version number from the first line
@@ -2012,8 +2170,8 @@ usage() {
     colorized_echo yellow "  -y, --yes               $(tput sgr0)✓  Auto-confirm uninstall and data removal"
     colorized_echo yellow "  --name NAME             $(tput sgr0)✓  Uninstall specific node instance"
     colorized_echo cyan "Install Options:"
-    colorized_echo yellow "  -v, --version VERSION   $(tput sgr0)✓  Install specific version"
-    colorized_echo yellow "  --pre-release           $(tput sgr0)✓  Install pre-release version"
+    colorized_echo yellow "  -v, --version VERSION   $(tput sgr0)✓  Install specific version (latest, dev or e.g. v0.5.7)"
+    colorized_echo yellow "  --pre-release, --dev    $(tput sgr0)✓  Install the pre-release (dev) image"
     colorized_echo yellow "  --name NAME             $(tput sgr0)✓  Install with custom name"
     colorized_echo yellow "  --override              $(tput sgr0)✓  Override existing installation"
     colorized_echo yellow "  --api-key KEY           $(tput sgr0)✓  Set API Key"
@@ -2034,11 +2192,15 @@ usage() {
     echo
     colorized_echo cyan "Node Information:"
     colorized_echo magenta "  Node IP: $NODE_IP_V4"
-    SERVICE_PORT=$(grep '^SERVICE_PORT[[:space:]]*=' "$APP_DIR/.env" | sed 's/^SERVICE_PORT[[:space:]]*=[[:space:]]*//')
-    colorized_echo magenta "  Service port: $SERVICE_PORT"
+    # Before install (or as a non-root user) there is no readable .env
+    local service_port="" api_key=""
+    if [ -r "$APP_DIR/.env" ]; then
+        service_port=$(grep '^SERVICE_PORT[[:space:]]*=' "$APP_DIR/.env" | sed 's/^SERVICE_PORT[[:space:]]*=[[:space:]]*//')
+        api_key=$(grep '^API_KEY[[:space:]]*=' "$APP_DIR/.env" | sed 's/^API_KEY[[:space:]]*=[[:space:]]*//')
+    fi
+    colorized_echo magenta "  Service port: $service_port"
     colorized_echo magenta "  Cert file path: $SSL_CERT_FILE"
-    API_KEY=$(grep '^API_KEY[[:space:]]*=' "$APP_DIR/.env" | sed 's/^API_KEY[[:space:]]*=[[:space:]]*//')
-    colorized_echo magenta "  API Key : $API_KEY"
+    colorized_echo magenta "  API Key : $api_key"
     echo
     current_version=$(get_current_xray_core_version)
     colorized_echo cyan "Current Xray-core version: " 1 # 1 for bold
@@ -2060,8 +2222,7 @@ geofiles_command() {
         case "$1" in
         --iran)
             colorized_echo blue "Downloading Iran geofiles..."
-            curl -sL "https://github.com/Chocolate4U/Iran-v2ray-rules/releases/latest/download/geoip.dat" -o "$DATA_DIR/assets/geoip.dat"
-            curl -sL "https://github.com/Chocolate4U/Iran-v2ray-rules/releases/latest/download/geosite.dat" -o "$DATA_DIR/assets/geosite.dat"
+            download_geofiles "https://github.com/Chocolate4U/Iran-v2ray-rules/releases/latest/download" "$DATA_DIR/assets"
             colorized_echo green "Iran geofiles downloaded to $DATA_DIR/assets"
             restart_needed=true
             args_provided=true
@@ -2069,8 +2230,7 @@ geofiles_command() {
             ;;
         --russia)
             colorized_echo blue "Downloading Russia geofiles..."
-            curl -sL "https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geoip.dat" -o "$DATA_DIR/assets/geoip.dat"
-            curl -sL "https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geosite.dat" -o "$DATA_DIR/assets/geosite.dat"
+            download_geofiles "https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download" "$DATA_DIR/assets"
             colorized_echo green "Russia geofiles downloaded to $DATA_DIR/assets"
             restart_needed=true
             args_provided=true
@@ -2078,8 +2238,7 @@ geofiles_command() {
             ;;
         --china)
             colorized_echo blue "Downloading China geofiles..."
-            curl -sL "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat" -o "$DATA_DIR/assets/geoip.dat"
-            curl -sL "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat" -o "$DATA_DIR/assets/geosite.dat"
+            download_geofiles "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download" "$DATA_DIR/assets"
             colorized_echo green "China geofiles downloaded to $DATA_DIR/assets"
             restart_needed=true
             args_provided=true
@@ -2189,26 +2348,25 @@ renew_cert_command() {
     # Generate new certificate
     gen_self_signed_cert
     
-    # Ask user if they want to restart the node
-    if docker ps --format '{{.Names}}' | grep -q "^$APP_NAME$"; then
-        colorized_echo cyan ""
-        colorized_echo yellow "The node needs to be restarted to apply the new certificate."
-        local restart_choice=""
-        if [ "$AUTO_CONFIRM" = true ]; then
-            restart_choice="n"
-        else
-            read -p "Do you want to restart the node now? (y/N): " restart_choice
-        fi
-        if [[ "$restart_choice" =~ ^[Yy]$ ]]; then
-            colorized_echo blue "Restarting node to apply new certificate..."
-            restart_command -n --no-restart-service
-            colorized_echo green "✓ Node restarted with new certificate"
-        else
-            colorized_echo yellow "Skipped restart. Please restart the node manually to apply the new certificate."
-            colorized_echo yellow "You can restart it later with: $APP_NAME restart"
-        fi
+    # The node and node-serviced load the certificate only at startup, so ask
+    # once and restart both on yes (the default, also with -y).
+    colorized_echo cyan ""
+    colorized_echo yellow "The node needs to be restarted to apply the new certificate."
+    local restart_choice=""
+    if [ "$AUTO_CONFIRM" = true ]; then
+        restart_choice="y"
+    else
+        read -r -p "Do you want to restart the node now? (Y/n): " restart_choice
     fi
-    
+    if [[ -z "$restart_choice" || "$restart_choice" =~ ^[Yy]$ ]]; then
+        colorized_echo blue "Restarting node to apply new certificate..."
+        restart_command -n
+        colorized_echo green "✓ Node restarted with new certificate"
+    else
+        colorized_echo yellow "Skipped restart. Please restart the node manually to apply the new certificate."
+        colorized_echo yellow "You can restart it later with: $APP_NAME restart"
+    fi
+
     colorized_echo cyan ""
     colorized_echo cyan "================================"
     colorized_echo green "✓ Certificate renewal completed!"
@@ -2216,7 +2374,6 @@ renew_cert_command() {
     colorized_echo magenta "Please use the following Certificate in pasarguard Panel (it's located in ${DATA_DIR}/certs):"
     cat "$SSL_CERT_FILE"
     colorized_echo cyan "================================"
-    restart_command
 }
 
 pg_node_main() {
@@ -2266,6 +2423,7 @@ pg_node_main() {
         renew_cert_command "$@"
         ;;
     install-script)
+        print_script_execution_header "pg-node" "$SCRIPT_COMMIT_SHA" "install"
         install_node_script
         ;;
     uninstall-script)
