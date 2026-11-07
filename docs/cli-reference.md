@@ -206,6 +206,7 @@ Installs or re-installs a worker node instance.
 - `-v`, `--version <VERSION>`: Install specific node image version.
 - `--pre-release`: Install latest pre-release image.
 - `--dev`: Install the `pasarguard/node:dev` image, built from the node `dev` branch. Unreleased, for testing only; `pg-node update` pulls the newest dev build. Cannot be combined with `--version` or `--pre-release`. To move an existing node to it, use `update --dev` instead.
+- `--xraycore <VERSION>`: Install a specific [Xray-core release](https://github.com/XTLS/Xray-core/releases) (`vX.Y.Z`, `X.Y.Z` or `latest`) into `/var/lib/<NAME>/xray-core` and point the node at it with `XRAY_EXECUTABLE_PATH`, instead of the core bundled in the image. The core is downloaded before the node is set up, so a missing release or a failed download stops the install early. Without it the node uses the image's core; `core-update` can switch it later.
 - `--name <NAME>`: Custom instance name (creates `/opt/<NAME>` and `/var/lib/<NAME>`).
 - `--override`: Force overwrite existing node instance.
 - `--api-key <KEY>`: Pre-configure API authentication key.
@@ -222,6 +223,7 @@ Installs or re-installs a worker node instance.
 
 ```bash
 sudo pg-node install --name node-eu1 --use-grpc --self-signed
+sudo pg-node install --xraycore v26.10.31
 ```
 
 #### `up` / `down` / `restart`
@@ -259,7 +261,7 @@ sudo pg-node update --version latest
 
 #### `core-update`
 Updates or switches the underlying `Xray-core` binary using [install_core.sh](../install_core.sh).
-- `--version <TAG>`: Specify release tag (e.g. `v1.8.24` or `latest`).
+- `--version <TAG>`: Specify release tag (e.g. `v26.10.31`, `26.10.31` or `latest`).
 ```bash
 sudo pg-node core-update --version latest
 ```
