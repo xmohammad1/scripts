@@ -1,101 +1,3 @@
-<div align="center">
-
-# PasarGuard Scripts
-
-**Modern deployment, orchestration, and disaster recovery suite for PasarGuard Panel and Nodes.**
-
-[![Unit Tests](https://github.com/PasarGuard/scripts/actions/workflows/command-tests.yml/badge.svg)](https://github.com/PasarGuard/scripts/actions/workflows/command-tests.yml)
-[![Backup Restore Tests](https://github.com/PasarGuard/scripts/actions/workflows/backup-restore.yml/badge.svg)](https://github.com/PasarGuard/scripts/actions/workflows/backup-restore.yml)
-[![Script Safety](https://github.com/PasarGuard/scripts/actions/workflows/script-update-safety.yml/badge.svg)](https://github.com/PasarGuard/scripts/actions/workflows/script-update-safety.yml)
-[![License](https://img.shields.io/github/license/PasarGuard/scripts)](LICENSE)
-[![Release](https://img.shields.io/github/v/release/PasarGuard/scripts)](https://github.com/PasarGuard/scripts/releases)
-
-[English](README.md) • [راهنمای فارسی (Standalone)](iran-sanction/README-pasarguard-standalone.fa.md) • [راهنمای فارسی نود (Standalone)](iran-sanction/README-pg-node-standalone.fa.md)
-
-</div>
-
----
-
-## 📑 Table of Contents
-- [Overview](#-overview)
-- [Architecture](#-architecture)
-- [System Requirements & OS Support](#-system-requirements--os-support)
-- [Quick Start](#-quick-start)
-  - [1. Installing PasarGuard Panel](#1-installing-pasarguard-panel)
-  - [2. Installing a Worker Node](#2-installing-a-worker-node)
-- [Installation Options](#-installation-options)
-- [Master CLI Reference](#-master-cli-reference)
-  - [Panel Commands (`pasarguard`)](#panel-commands-pasarguard)
-  - [Node Commands (`pg-node`)](#node-commands-pg-node)
-- [Database Support Matrix](#-database-support-matrix)
-- [Backups & Disaster Recovery](#-backups--disaster-recovery)
-- [SSL & TLS Security](#-ssl--tls-security)
-- [Domestic Mirrors & Air-Gapped Networks](#-domestic-mirrors--air-gapped-networks)
-- [Documentation Index](#-documentation-index)
-- [Contributing & Testing](#-contributing--testing)
-
----
-
-## 🌟 Overview
-
-**PasarGuard Scripts** provides battle-tested automation for deploying and maintaining production-grade PasarGuard infrastructure:
-- **PasarGuard Panel (`pasarguard.sh` / `pasarguard`)**: Orchestrates the web dashboard, database engines (SQLite, MySQL, MariaDB, PostgreSQL, TimescaleDB), PgBouncer connection pooling, admin web UIs (pgAdmin, phpMyAdmin), and disaster recovery.
-- **PasarGuard Node (`pg-node.sh` / `pg-node`)**: Manages remote worker nodes, systemd background daemons (`pg-node-service`), Xray-core versions, routing geofiles, and TLS certificates.
-- **Disaster Recovery**: Automated recurring backups to Telegram with proxy support, multi-database cluster snapshots, and fail-closed TimescaleDB version compatibility gates.
-- **Domestic Mirror Optimization**: Benchmark and apply domestic Iranian mirrors for APT and Docker when deploying behind restricted network environments.
-
----
-
-## 🏗️ Architecture
-
-```
-                               ┌─────────────────────────────────────────┐
-                               │             PasarGuard Panel            │
-                               │   (Web Dashboard & Background Tasks)    │
-                               └──────┬──────────────────────┬───────────┘
-                                      │                      │
-                   ┌──────────────────┴────────┐      ┌──────┴────────────────────┐
-                   ▼                           ▼      ▼                           ▼
-          ┌─────────────────┐         ┌────────────────────┐            ┌───────────────────┐
-          │  SQLite / MySQL │         │     PgBouncer      │            │ Automated Backup  │
-          │    / MariaDB    │         │  (Port 6432 Pool)  │            │  (Telegram + Cron)│
-          └─────────────────┘         └────────┬───────────┘            └───────────────────┘
-                                               │
-                                      ┌────────┴───────────┐
-                                      │ PostgreSQL 17 /    │
-                                      │   TimescaleDB      │
-                                      └────────────────────┘
-                                               ▲
-                                               │ (Encrypted gRPC / REST)
-                   ┌───────────────────────────┴───────────────────────────┐
-                   ▼                                                       ▼
-        ┌─────────────────────┐                                 ┌─────────────────────┐
-        │  Worker Node: EU-1  │                                 │  Worker Node: AS-1  │
-        │  (pg-node + Xray)   │                                 │  (pg-node + Xray)   │
-        └─────────────────────┘                                 └─────────────────────┘
-```
-
----
-
-## 🖥️ System Requirements & OS Support
-
-| Operating System | Package Manager | Status |
-| :--- | :--- | :--- |
-| **Ubuntu 20.04 / 22.04 / 24.04** | `apt-get` | Supported (Primary) |
-| **Debian 11 / 12** | `apt-get` | Supported |
-| **CentOS / RHEL 8+** | `dnf` / `yum` | Supported |
-| **Rocky Linux / AlmaLinux 8+** | `dnf` | Supported |
-| **Fedora 38+** | `dnf` | Supported |
-| **Arch Linux** | `pacman` | Supported |
-| **openSUSE Leap / Tumbleweed** | `zypper` | Supported |
-
-**Prerequisites**:
-- Linux x86_64 or ARM64
-- Root or `sudo` privileges
-- Docker and Docker Compose (automatically installed if absent)
-- `curl`, `tar`, `gzip`
-
----
 
 ## 🚀 Quick Start
 
@@ -126,19 +28,22 @@ sudo pasarguard status
 ### 2. Installing a Worker Node
 
 On each remote worker node, download and execute the node installer:
+normal install
+```bash
+sudo bash -c "$(curl -fsSL https://github.com/xmohammad1/scripts/raw/main/pg-node.sh)" @ install
+```
+install dev
+```bash
+sudo bash -c "$(curl -fsSL https://github.com/xmohammad1/scripts/raw/main/pg-node.sh)" @ install --dev
+```
+install a specific xray version
+```bash
+sudo bash -c "$(curl -fsSL https://github.com/xmohammad1/scripts/raw/main/pg-node.sh)" @ install --dev --xraycore v26.3.27
+```
 
 ```bash
-# Download node installer script
-curl -fsSL https://raw.githubusercontent.com/PasarGuard/scripts/main/pg-node.sh -o pg-node.sh
-
-# Standard node installation
-sudo bash pg-node.sh install
-
 # Multi-instance node with custom name
-sudo bash pg-node.sh install --name node-de1 --self-signed
-
-# Testers only: the unreleased pasarguard/node:dev image (built from the node dev branch)
-sudo bash pg-node.sh install --dev
+sudo bash -c "$(curl -fsSL https://github.com/xmohammad1/scripts/raw/main/pg-node.sh)" @ install --name node-de1 --self-signed
 # or switch an installed node to it, and back to the latest release later
 # (a node installed before these options existed: run `sudo pg-node update` once first)
 sudo pg-node update --dev
